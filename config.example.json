@@ -1,0 +1,39 @@
+{
+  "paths": {
+    "status_file": "C:/Users/YourUser/Saved Games/Frontier Developments/Elite Dangerous/Status.json",
+    "journal_dir": "C:/Users/YourUser/Saved Games/Frontier Developments/Elite Dangerous",
+    "cargo_file": "C:/Users/YourUser/Saved Games/Frontier Developments/Elite Dangerous/Cargo.json",
+    "market_file": "C:/Users/YourUser/Saved Games/Frontier Developments/Elite Dangerous/Market.json",
+    "bindings_dir": "C:/Users/YourUser/AppData/Local/Frontier Developments/Elite Dangerous/Options/Bindings",
+    "start_preset_file": "C:/Users/YourUser/AppData/Local/Frontier Developments/Elite Dangerous/Options/Bindings/StartPreset.4.start",
+    "logs_dir": "logs",
+    "debug_snapshots_dir": "debug_snapshots"
+  },
+  "runtime": {
+    "action_timeout_seconds": 30.0,
+    "poll_interval_seconds": 0.5
+  },
+  "controls": {
+    "throttle_zero": "x",
+    "throttle_fifty": "c",
+    "throttle_seventy_five": "v",
+    "throttle_full": "w",
+    "throttle_reverse_full": "9",
+    "boost": "tab",
+    "open_left_panel": "1",
+    "cycle_previous_panel": "q",
+    "cycle_next_panel": "e",
+    "ui_up": "up",
+    "ui_down": "down",
+    "ui_left": "left",
+    "ui_right": "right",
+    "ui_select": "space",
+    "ui_back": "backspace",
+    "charge_fsd": "j",
+    "thrust_up": "r",
+    "pitch_up": "y",
+    "pitch_down": "h",
+    "yaw_left": "a",
+    "yaw_right": "d"
+  }
+}

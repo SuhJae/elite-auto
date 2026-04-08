@@ -1,0 +1,6 @@
+comtypes==1.4.16
+dxcam==0.3.0
+numpy==2.4.4
+opencv-python==4.13.0.92
+PyDirectInput==1.0.4
+watchdog==6.0.0
