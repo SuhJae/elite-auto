@@ -56,7 +56,37 @@ def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
     if image is None:
         return CompassReadResult(status="missing")
 
-    roi = _extract_roi(image, config.roi_region())
+    primary_region = config.roi_region()
+    result = _detect_compass_marker_in_region(image, primary_region, config)
+    if result.is_detected:
+        return result
+    if result.status not in {"missing", "circle_only"}:
+        return result
+
+    for fallback_region in _fallback_compass_regions(image, primary_region, config):
+        fallback_result = _detect_compass_marker_in_region(image, fallback_region, config)
+        if fallback_result.is_detected:
+            return fallback_result
+        if result.status == "missing" and fallback_result.status == "circle_only":
+            result = fallback_result
+
+    return result
+
+
+def _detect_compass_marker_in_region(
+    image: Any,
+    roi_region: Region,
+    config: AlignConfig,
+) -> CompassReadResult:
+    roi = _extract_roi(image, roi_region)
+    return _detect_compass_marker_in_roi(roi, roi_region, config)
+
+
+def _detect_compass_marker_in_roi(
+    roi: np.ndarray,
+    roi_region: Region,
+    config: AlignConfig,
+) -> CompassReadResult:
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     marker_mask = _build_marker_mask(roi, hsv, config)
     mask_closed = cv2.morphologyEx(marker_mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
@@ -132,10 +162,10 @@ def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
     outer_ring_occupancy = float(marker_detection["outer_ring_occupancy"])
     candidate_area = int(marker_detection["area"])
 
-    marker_x = config.roi_region()[0] + marker_local_x
-    marker_y = config.roi_region()[1] + marker_local_y
-    compass_center_x = config.roi_region()[0] + compass_center_local_x
-    compass_center_y = config.roi_region()[1] + compass_center_local_y
+    marker_x = roi_region[0] + marker_local_x
+    marker_y = roi_region[1] + marker_local_y
+    compass_center_x = roi_region[0] + compass_center_local_x
+    compass_center_y = roi_region[1] + compass_center_local_y
     dx = marker_x - compass_center_x
     dy = marker_y - compass_center_y
     control_dx, control_dy = _rotate_offset(dx, dy, config.compass_control_rotation_radians)
@@ -165,12 +195,80 @@ def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
         component_area=candidate_area,
         inner_occupancy=inner_occupancy,
         outer_ring_occupancy=outer_ring_occupancy,
-        roi_region=config.roi_region(),
+        roi_region=roi_region,
         compass_center_x=compass_center_x,
         compass_center_y=compass_center_y,
         compass_radius_estimate_px=compass_radius_estimate,
     )
     return CompassReadResult(status=state, marker=marker)
+
+
+def _fallback_compass_regions(
+    image: Any,
+    primary_region: Region,
+    config: AlignConfig,
+) -> list[Region]:
+    try:
+        roi = _extract_roi(image, primary_region)
+    except ValueError:
+        return []
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    strong_ring_mask, weak_ring_mask = _build_compass_ring_masks(roi, hsv, config)
+    ring_mask = np.logical_or(strong_ring_mask > 0, weak_ring_mask > 0)
+    if not np.any(ring_mask):
+        return []
+
+    edge_margin = max(8, int(round(config.compass_radius_px * 0.25)))
+    edge_counts = {
+        "top": int(ring_mask[:edge_margin, :].sum()),
+        "bottom": int(ring_mask[-edge_margin:, :].sum()),
+        "left": int(ring_mask[:, :edge_margin].sum()),
+        "right": int(ring_mask[:, -edge_margin:].sum()),
+    }
+
+    regions: list[Region] = []
+    if edge_counts["bottom"] >= max(24, int(edge_counts["top"] * 1.5)):
+        for dy in (24, 48, 72, 96, 120):
+            region = _shift_region(primary_region, image.shape, dx=0, dy=dy)
+            if region is not None:
+                regions.append(region)
+    elif edge_counts["top"] >= max(24, int(edge_counts["bottom"] * 1.5)):
+        for dy in (-24, -48, -72, -96, -120):
+            region = _shift_region(primary_region, image.shape, dx=0, dy=dy)
+            if region is not None:
+                regions.append(region)
+
+    if edge_counts["left"] >= max(24, int(edge_counts["right"] * 1.5)):
+        for dx in (-16, -32):
+            region = _shift_region(primary_region, image.shape, dx=dx, dy=0)
+            if region is not None:
+                regions.append(region)
+    elif edge_counts["right"] >= max(24, int(edge_counts["left"] * 1.5)):
+        for dx in (16, 32):
+            region = _shift_region(primary_region, image.shape, dx=dx, dy=0)
+            if region is not None:
+                regions.append(region)
+
+    deduped: list[Region] = []
+    seen: set[Region] = set()
+    for region in regions:
+        if region == primary_region or region in seen:
+            continue
+        seen.add(region)
+        deduped.append(region)
+    return deduped
+
+
+def _shift_region(region: Region, image_shape: tuple[int, ...], *, dx: int, dy: int) -> Region | None:
+    left, top, width, height = region
+    shifted_left = left + dx
+    shifted_top = top + dy
+    if shifted_left < 0 or shifted_top < 0:
+        return None
+    if shifted_left + width > image_shape[1] or shifted_top + height > image_shape[0]:
+        return None
+    return (shifted_left, shifted_top, width, height)
 
 
 def _recover_compass_circle_from_center_hint(
