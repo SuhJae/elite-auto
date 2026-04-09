@@ -2593,7 +2593,7 @@ def _main() -> int:
                 STANDALONE_COMPASS_OUTER_RADIUS_PX - STANDALONE_COMPASS_INNER_RADIUS_PX,
             ),
             compass_control_rotation_degrees=STANDALONE_COMPASS_CONTROL_ROTATION_DEGREES,
-            debug_window_enabled=False,
+            debug_window_enabled=True,
             final_reticle_enabled=True,
             near_center_consensus_pause_seconds=2.0,
             near_center_consensus_samples=3,

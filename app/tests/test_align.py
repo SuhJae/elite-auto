@@ -1314,6 +1314,7 @@ class TestAlignAction(unittest.TestCase):
         self.assertEqual(result.status, "filled")
         assert result.marker is not None
         self.assertLess(result.marker.distance, 2.0)
+        self.assertLess(result.marker.compass_radius_estimate_px, 26.0)
         self.assertLess(result.marker.compass_center_x, 700.0)
         self.assertGreater(result.marker.compass_center_y, 850.0)
 
@@ -1328,6 +1329,7 @@ class TestAlignAction(unittest.TestCase):
         self.assertEqual(result.status, "filled")
         assert result.marker is not None
         self.assertLess(result.marker.distance, 3.0)
+        self.assertLess(result.marker.compass_radius_estimate_px, 26.0)
         self.assertLess(result.marker.compass_center_x, 700.0)
         self.assertLess(result.marker.compass_center_y, 820.0)
 
@@ -1342,8 +1344,33 @@ class TestAlignAction(unittest.TestCase):
         self.assertEqual(result.status, "filled")
         assert result.marker is not None
         self.assertLess(result.marker.distance, 2.0)
+        self.assertLess(result.marker.compass_radius_estimate_px, 26.0)
         self.assertGreater(result.marker.compass_center_x, 780.0)
         self.assertLess(result.marker.compass_center_y, 790.0)
+
+    def test_compass_template_refinement_tracks_bad_orb_case_200440(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T200440_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T200440_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        assert result.marker is not None
+        self.assertLess(result.marker.distance, 8.0)
+        self.assertLess(result.marker.compass_radius_estimate_px, 26.0)
+
+    def test_compass_template_refinement_tracks_bad_orb_case_200540(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T200540_align_dwell_exit_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T200540_align_dwell_exit_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        assert result.marker is not None
+        self.assertLess(result.marker.distance, 8.0)
+        self.assertLess(result.marker.compass_radius_estimate_px, 26.0)
 
     def test_final_phase_command_selection_handles_irregular_timing_inputs(self) -> None:
         timeline: list[tuple[str, object]] = []
