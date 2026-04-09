@@ -762,7 +762,7 @@ def _detect_compass_circle(
             expected_center_x=roi_center_x,
             expected_center_y=roi_center_y,
             expected_radius=expected_radius,
-            max_center_error_px=None,
+            max_center_error_px=config.circle_detection_max_center_error_px if config.circle_detection_max_center_error_px > 0.0 else None,
             config=config,
         )
         score += candidate.get("source_bonus", 0.0)
