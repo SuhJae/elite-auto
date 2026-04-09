@@ -24,6 +24,10 @@ class DxcamCapture(Capture):
     def output_index(self) -> int:
         return self._output_index
 
+    @property
+    def target_fps(self) -> int | None:
+        return self._target_fps
+
     def set_output_index(self, output_index: int) -> None:
         if output_index == self._output_index:
             return
@@ -31,6 +35,23 @@ class DxcamCapture(Capture):
         self._camera = None
         self._started = False
         self._output_index = output_index
+
+    def set_target_fps(self, target_fps: int | None) -> int | None:
+        previous_target_fps = self._target_fps
+        if target_fps == self._target_fps:
+            return previous_target_fps
+
+        self._target_fps = target_fps
+        if self._camera is None or not self._started:
+            return previous_target_fps
+
+        if previous_target_fps:
+            self._camera.stop()
+
+        if self._target_fps:
+            self._camera.start(target_fps=self._target_fps)
+
+        return previous_target_fps
 
     def start(self) -> None:
         if self._started:
@@ -70,4 +91,10 @@ class DxcamCapture(Capture):
 
         if frame is None:
             raise RuntimeError("dxcam returned no frame. Check monitor/output availability.")
+
+        if self._target_fps and region is not None:
+            x, y, width, height = region
+            if frame.shape[1] < x + width or frame.shape[0] < y + height:
+                raise RuntimeError("dxcam frame is smaller than the requested capture region.")
+            frame = frame[y : y + height, x : x + width]
         return frame

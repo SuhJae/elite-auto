@@ -49,7 +49,7 @@ class ReticleTrackerConfig:
     hough_param1: float = 80.0
     hough_param2: float = 12.0
     min_score: float = 1.10
-    max_center_distance_px: float = 1_000.0
+    max_center_distance_px: float = 160.0
     max_missing_sector_occ: float = 0.90
     max_inner_leak: float = 0.18
     min_tick_occ: float = 0.22

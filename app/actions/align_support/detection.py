@@ -92,8 +92,23 @@ def _detect_compass_marker_in_roi(
     mask_closed = cv2.morphologyEx(marker_mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
     fallback_mask = _build_fallback_warm_mask(hsv, config)
 
-    # Phase 1: detect the center dot independently.
-    center_dot_hint = _detect_compass_center_dot(mask_closed, hsv, fallback_mask, config)
+    # Phase 1: detect warm center-dot candidates independently. The real compass
+    # behaves like a small cyan bubble that contains a warm marker, so we keep
+    # several plausible warm candidates around instead of trusting a single
+    # center-biased hint.
+    center_dot_candidates = _detect_compass_center_dot_candidates(mask_closed, hsv, fallback_mask, config)
+    center_dot_hint = None if not center_dot_candidates else (
+        center_dot_candidates[0]["x"],
+        center_dot_candidates[0]["y"],
+    )
+    best_recovery = _recover_best_compass_circle_from_center_hints(
+        roi=roi,
+        hsv=hsv,
+        primary_mask=mask_closed,
+        fallback_mask=fallback_mask,
+        config=config,
+        center_dot_candidates=center_dot_candidates,
+    )
 
     # Phase 2: detect the compass circle independently of the dot hint.
     circle = _detect_compass_circle(
@@ -104,19 +119,9 @@ def _detect_compass_marker_in_roi(
         center_hint_y=None if center_dot_hint is None else center_dot_hint[1],
     )
     recovered_marker_detection: dict[str, float | str] | None = None
-    if circle is None and center_dot_hint is not None:
-        recovery = _recover_compass_circle_from_center_hint(
-            roi=roi,
-            hsv=hsv,
-            primary_mask=mask_closed,
-            fallback_mask=fallback_mask,
-            config=config,
-            center_hint_x=center_dot_hint[0],
-            center_hint_y=center_dot_hint[1],
-        )
-        if recovery is not None:
-            circle = recovery["circle"]
-            recovered_marker_detection = recovery["marker_detection"]
+    if circle is None and best_recovery is not None:
+        circle = best_recovery["circle"]
+        recovered_marker_detection = best_recovery["marker_detection"]
     if circle is None:
         return CompassReadResult(status="missing")
 
@@ -135,7 +140,14 @@ def _detect_compass_marker_in_roi(
         center_y=compass_center_local_y,
         search_radius_px=config.max_marker_distance_px,
     ):
-        return CompassReadResult(status="circle_only")
+        if best_recovery is not None:
+            circle = best_recovery["circle"]
+            recovered_marker_detection = best_recovery["marker_detection"]
+            compass_center_local_x = circle["center_x"]
+            compass_center_local_y = circle["center_y"]
+            compass_radius_estimate = circle["radius"]
+        else:
+            return CompassReadResult(status="circle_only")
 
     # Phase 3: detect the marker relative to the finalized circle center.
     marker_detection = (
@@ -150,6 +162,15 @@ def _detect_compass_marker_in_roi(
             local_center_y=compass_center_local_y,
         )
     )
+    if recovered_marker_detection is None and best_recovery is not None:
+        recovery_detection = best_recovery["marker_detection"]
+        if _should_prefer_hint_recovery(marker_detection, recovery_detection):
+            circle = best_recovery["circle"]
+            recovered_marker_detection = recovery_detection
+            marker_detection = recovery_detection
+            compass_center_local_x = circle["center_x"]
+            compass_center_local_y = circle["center_y"]
+            compass_radius_estimate = circle["radius"]
     if marker_detection["status"] == "circle_only":
         return CompassReadResult(status="circle_only")
     if marker_detection["status"] != "detected":
@@ -281,7 +302,7 @@ def _recover_compass_circle_from_center_hint(
     center_hint_x: float,
     center_hint_y: float,
 ) -> dict[str, Any] | None:
-    strong_ring_mask, _ = _build_compass_ring_masks(roi, hsv, config)
+    strong_ring_mask, weak_ring_mask = _build_compass_ring_masks(roi, hsv, config)
     refined_center = _find_inner_ring_center_by_offset_search(
         strong_ring_mask,
         expected_center_x=center_hint_x,
@@ -320,15 +341,92 @@ def _recover_compass_circle_from_center_hint(
     if marker_detection.get("status") != "detected":
         return None
 
+    refined_radius = _refine_compass_radius_around_center(
+        strong_ring_mask=strong_ring_mask,
+        weak_ring_mask=weak_ring_mask,
+        center_x=refined_center_x,
+        center_y=refined_center_y,
+        config=config,
+    )
+
     return {
         "circle": {
             "center_x": refined_center_x,
             "center_y": refined_center_y,
-            "radius": max(config.compass_radius_px, 1.0),
+            "radius": refined_radius,
             "score": refined_score,
         },
         "marker_detection": marker_detection,
     }
+
+
+def _refine_compass_radius_around_center(
+    *,
+    strong_ring_mask: np.ndarray,
+    weak_ring_mask: np.ndarray,
+    center_x: float,
+    center_y: float,
+    config: AlignConfig,
+) -> float:
+    min_radius = max(14.0, config.compass_radius_px - max(10.0, config.circle_detection_radius_tolerance_px + 4.0))
+    max_radius = config.compass_radius_px + max(6.0, config.circle_detection_radius_tolerance_px * 0.5)
+    best_radius = max(1.0, config.compass_radius_px)
+    best_score = float("-inf")
+
+    for radius in np.arange(min_radius, max_radius + 0.5, 1.0):
+        score = _score_compass_circle_candidate(
+            strong_ring_mask=strong_ring_mask,
+            weak_ring_mask=weak_ring_mask,
+            center_x=center_x,
+            center_y=center_y,
+            radius=float(radius),
+            axis_x=float(radius),
+            axis_y=float(radius),
+            angle_degrees=0.0,
+            expected_center_x=center_x,
+            expected_center_y=center_y,
+            expected_radius=float(radius),
+            max_center_error_px=None,
+            config=config,
+        )
+        if score > best_score:
+            best_score = score
+            best_radius = float(radius)
+
+    return best_radius
+
+
+def _recover_best_compass_circle_from_center_hints(
+    *,
+    roi: np.ndarray,
+    hsv: np.ndarray,
+    primary_mask: np.ndarray,
+    fallback_mask: np.ndarray,
+    config: AlignConfig,
+    center_dot_candidates: list[dict[str, float]],
+) -> dict[str, Any] | None:
+    best_recovery: dict[str, Any] | None = None
+    best_score = float("-inf")
+
+    for candidate in center_dot_candidates[:8]:
+        recovery = _recover_compass_circle_from_center_hint(
+            roi=roi,
+            hsv=hsv,
+            primary_mask=primary_mask,
+            fallback_mask=fallback_mask,
+            config=config,
+            center_hint_x=float(candidate["x"]),
+            center_hint_y=float(candidate["y"]),
+        )
+        if recovery is None:
+            continue
+        score = _marker_detection_preference_score(recovery["marker_detection"]) + float(recovery["circle"]["score"])
+        score -= float(candidate["distance"]) * 0.01
+        if score > best_score:
+            best_score = score
+            best_recovery = recovery
+
+    return best_recovery
 
 
 def _detect_compass_marker_relative_to_circle(
@@ -445,6 +543,34 @@ def _detect_compass_marker_relative_to_circle(
     return {"status": "circle_only"}
 
 
+def _marker_detection_preference_score(marker_detection: dict[str, float | str]) -> float:
+    if marker_detection.get("status") != "detected":
+        return float("-inf")
+
+    state = str(marker_detection.get("marker_state"))
+    inner_occupancy = float(marker_detection.get("inner_occupancy", 0.0))
+    outer_ring_occupancy = float(marker_detection.get("outer_ring_occupancy", 0.0))
+    area = float(marker_detection.get("area", 0.0))
+
+    score = (outer_ring_occupancy * 4.0) + (area * 0.02)
+    if state == "filled":
+        score += 4.0 + (inner_occupancy * 3.0)
+    else:
+        score += 0.5 - (inner_occupancy * 3.0)
+    return score
+
+
+def _should_prefer_hint_recovery(
+    current_detection: dict[str, float | str],
+    recovery_detection: dict[str, float | str],
+) -> bool:
+    if current_detection.get("status") != "detected":
+        return True
+    return _marker_detection_preference_score(recovery_detection) > (
+        _marker_detection_preference_score(current_detection) + 0.75
+    )
+
+
 def _build_marker_mask(roi: np.ndarray, hsv: np.ndarray, config: AlignConfig) -> np.ndarray:
     warm_mask = cv2.inRange(
         hsv,
@@ -489,18 +615,36 @@ def _detect_compass_center_dot(
     fallback_mask: np.ndarray,
     config: AlignConfig,
 ) -> tuple[float, float] | None:
+    candidates = _detect_compass_center_dot_candidates(mask, hsv, fallback_mask, config)
+    best_candidate = None if not candidates else candidates[0]
+    if best_candidate is None:
+        return None
+    return best_candidate["x"], best_candidate["y"]
+
+
+def _detect_compass_center_dot_candidates(
+    mask: np.ndarray,
+    hsv: np.ndarray,
+    fallback_mask: np.ndarray,
+    config: AlignConfig,
+) -> list[dict[str, float]]:
     anchor_x = mask.shape[1] / 2.0
     anchor_y = mask.shape[0] / 2.0
-    best_candidate = _find_center_dot_candidate(
-        mask,
-        hsv,
-        anchor_x,
-        anchor_y,
-        config,
-        search_radius_px=config.center_dot_search_radius_px,
+    expanded_search_radius = max(mask.shape[0], mask.shape[1]) / 1.6
+    candidates: list[dict[str, float]] = []
+
+    candidates.extend(
+        _find_center_dot_candidates(
+            mask,
+            hsv,
+            anchor_x,
+            anchor_y,
+            config,
+            search_radius_px=config.center_dot_search_radius_px,
+        )
     )
-    if best_candidate is None:
-        best_candidate = _find_center_dot_candidate(
+    candidates.extend(
+        _find_center_dot_candidates(
             fallback_mask,
             hsv,
             anchor_x,
@@ -508,28 +652,38 @@ def _detect_compass_center_dot(
             config,
             search_radius_px=config.center_dot_search_radius_px,
         )
-    expanded_search_radius = min(max(mask.shape[0], mask.shape[1]) / 2.0, config.max_marker_distance_px)
-    if best_candidate is None and expanded_search_radius > config.center_dot_search_radius_px:
-        best_candidate = _find_center_dot_candidate(
-            mask,
-            hsv,
-            anchor_x,
-            anchor_y,
-            config,
-            search_radius_px=expanded_search_radius,
+    )
+    if expanded_search_radius > config.center_dot_search_radius_px:
+        candidates.extend(
+            _find_center_dot_candidates(
+                mask,
+                hsv,
+                anchor_x,
+                anchor_y,
+                config,
+                search_radius_px=expanded_search_radius,
+            )
         )
-    if best_candidate is None and expanded_search_radius > config.center_dot_search_radius_px:
-        best_candidate = _find_center_dot_candidate(
-            fallback_mask,
-            hsv,
-            anchor_x,
-            anchor_y,
-            config,
-            search_radius_px=expanded_search_radius,
+        candidates.extend(
+            _find_center_dot_candidates(
+                fallback_mask,
+                hsv,
+                anchor_x,
+                anchor_y,
+                config,
+                search_radius_px=expanded_search_radius,
+            )
         )
-    if best_candidate is None:
-        return None
-    return best_candidate["x"], best_candidate["y"]
+
+    deduped: list[dict[str, float]] = []
+    seen: set[tuple[int, int]] = set()
+    for candidate in sorted(candidates, key=lambda item: item["priority"], reverse=True):
+        key = (int(round(candidate["x"] / 2.0)), int(round(candidate["y"] / 2.0)))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
 
 
 def _find_center_dot_candidate(
@@ -572,6 +726,47 @@ def _find_center_dot_candidate(
             best_candidate = candidate
 
     return best_candidate
+
+
+def _find_center_dot_candidates(
+    mask: np.ndarray,
+    hsv: np.ndarray,
+    anchor_x: float,
+    anchor_y: float,
+    config: AlignConfig,
+    *,
+    search_radius_px: float,
+) -> list[dict[str, float]]:
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    candidates: list[dict[str, float]] = []
+
+    for index in range(1, num_labels):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < config.center_dot_min_area or area > config.center_dot_max_area:
+            continue
+
+        centroid_x = float(centroids[index][0])
+        centroid_y = float(centroids[index][1])
+        distance = math.hypot(centroid_x - anchor_x, centroid_y - anchor_y)
+        if distance > search_radius_px:
+            continue
+
+        component_mask = labels == index
+        mean_value = float(hsv[:, :, 2][component_mask].mean()) if np.any(component_mask) else 0.0
+        distance_weight = distance if search_radius_px <= config.center_dot_search_radius_px else (distance * 0.20)
+        priority = (mean_value * 0.04) + (float(area) * 0.15) - distance_weight
+        candidates.append(
+            {
+                "x": centroid_x,
+                "y": centroid_y,
+                "distance": distance,
+                "area": float(area),
+                "mean_value": mean_value,
+                "priority": priority,
+            }
+        )
+
+    return candidates
 
 
 def _circle_search_bounds(
@@ -1066,6 +1261,20 @@ def _detect_compass_circle(
                     "radius": refined_candidate["radius"],
                     "score": score,
                 }
+
+    if (
+        best_circle is not None
+        and best_score > 0.0
+        and center_hint_x is not None
+        and center_hint_y is not None
+    ):
+        hint_distance = math.hypot(best_circle["center_x"] - center_hint_x, best_circle["center_y"] - center_hint_y)
+        max_hint_distance = min(
+            config.max_marker_distance_px,
+            best_circle["radius"] + max(6.0, config.center_dot_circle_center_max_distance_px),
+        )
+        if hint_distance > max_hint_distance:
+            return None
 
     if best_circle is not None and best_score > 0.0:
         return best_circle

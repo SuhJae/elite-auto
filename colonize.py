@@ -83,12 +83,24 @@ class ColonizeFsm:
     leave_station_timings: LeaveStationTimings = field(default_factory=LeaveStationTimings)
     leave_construction_timings: LeaveConstructionTimings = field(default_factory=LeaveConstructionTimings)
     navigation_timings: NavigationTimings = field(default_factory=NavigationTimings)
-    align_config: AlignConfig = field(default_factory=AlignConfig)
+    align_config: AlignConfig = field(
+        default_factory=lambda: AlignConfig(
+            debug_window_enabled=True,
+            final_reticle_enabled=True,
+            near_center_consensus_pause_seconds=2.0,
+            near_center_consensus_samples=3,
+            near_center_consensus_span_seconds=0.30,
+        )
+    )
     pre_dock_align_config: AlignConfig = field(
         default_factory=lambda: AlignConfig(
             alignment_tolerance_px=4.0,
             axis_alignment_tolerance_px=4.0,
-            confirmation_reads=1,
+            debug_window_enabled=True,
+            final_reticle_enabled=True,
+            near_center_consensus_pause_seconds=2.0,
+            near_center_consensus_samples=3,
+            near_center_consensus_span_seconds=0.30,
         )
     )
     fsd_timings: FsdTimings = field(default_factory=FsdTimings)

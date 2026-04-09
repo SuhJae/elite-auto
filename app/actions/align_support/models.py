@@ -73,6 +73,7 @@ class AlignConfig:
     final_reticle_alignment_tolerance_px: float = 30.0
     final_reticle_axis_tolerance_px: float = 20.0
     final_reticle_stationary_seconds: float = 2.0
+    final_reticle_missing_compass_fallback_seconds: float = 2.5
     final_reticle_required_consecutive_detections: int = 5
     final_reticle_max_consecutive_misses: int = 3
     final_reticle_settle_seconds: float = 2.0
@@ -115,6 +116,7 @@ class AlignConfig:
     runtime_profile_gain_scale_min: float = 0.55
     runtime_profile_gain_scale_max: float = 1.85
     missing_detection_fail_seconds: float = 1.50
+    missing_detection_abort_seconds: float = 30.0
     debug_window_enabled: bool = False
     debug_snapshot_interval_seconds: float = 5.0
     debug_window_scale: int = 2
@@ -127,6 +129,7 @@ class AlignConfig:
     pitch_release_threshold: float = 0.08
     yaw_engage_threshold: float = 0.22
     yaw_release_threshold: float = 0.08
+    hollow_force_actuation_error_px: float = 3.0
     controller_output_slew_per_second: float = 3.0
     error_derivative_low_pass_alpha: float = 0.35
     key_state_min_hold_seconds: float = 0.18

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import tempfile
 import unittest
@@ -13,13 +14,18 @@ from app.actions.align import (
     AlignConfig,
     AlignToTargetCompass,
     _AxisDynamicsProfile,
+    _FinalPhaseEpisode,
     CompassMarker,
     CompassReadResult,
     _AxisControllerState,
     _SteeringState,
+    _choose_final_phase_action,
     _compute_axis_controller_output,
+    _create_final_phase_controller_state,
     _desired_key_for_output,
+    _detect_final_reticle,
     _slew_limit,
+    _update_final_phase_model_from_episode,
     detect_compass_marker,
 )
 from app.actions.track_center_reticle import ReticleDetection
@@ -29,6 +35,7 @@ from app.domain.models import ShipState
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakeStateReader:
@@ -131,6 +138,23 @@ class FakeMonotonic:
     def __call__(self) -> float:
         current = self._value
         self._value += self._step
+        return current
+
+
+class SequencedMonotonic:
+    def __init__(self, start: float = 0.0, steps: list[float] | None = None, default_step: float = 0.05) -> None:
+        self._value = start
+        self._steps = steps or []
+        self._default_step = default_step
+        self._index = 0
+
+    def __call__(self) -> float:
+        current = self._value
+        if self._index < len(self._steps):
+            self._value += self._steps[self._index]
+        else:
+            self._value += self._default_step
+        self._index += 1
         return current
 
 
@@ -768,13 +792,208 @@ class TestAlignAction(unittest.TestCase):
         self.assertIn("near_center_consensus", result.debug)
         self.assertEqual(result.debug["near_center_consensus"]["sample_count"], 3)
 
-    def test_final_reticle_stage_returns_success_when_centered(self) -> None:
+    def test_final_phase_does_not_succeed_from_compass_center_alone(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_required_consecutive_detections=1,
+            timeout_seconds=0.6,
+        )
+        off_center_reticle = (
+            ReticleDetection(
+                found=True,
+                center_x=(frame.shape[1] / 2.0) + 35.0,
+                center_y=(frame.shape[0] / 2.0) - 12.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, _, _ = build_context([frame] * 10, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=0.0, dy=0.0, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=off_center_reticle
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        assert result.debug is not None
+        self.assertIn("final_reticle", result.debug)
+        self.assertIn("final_phase", result.debug)
+        self.assertTrue(result.debug["final_reticle"]["found"])
+
+    def test_final_phase_single_axis_choice_does_not_touch_aligned_yaw(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_required_consecutive_detections=1,
+            timeout_seconds=0.6,
+        )
+        mostly_vertical_reticle = (
+            ReticleDetection(
+                found=True,
+                center_x=(frame.shape[1] / 2.0) + 10.0,
+                center_y=(frame.shape[0] / 2.0) + 34.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, _, _ = build_context([frame] * 10, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=0.0, dy=0.0, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=mostly_vertical_reticle
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        self.assertIn(("key_down", context.config.controls.pitch_down), timeline)
+        self.assertNotIn(("key_down", context.config.controls.yaw_left), timeline)
+        self.assertNotIn(("key_down", context.config.controls.yaw_right), timeline)
+
+    def test_final_phase_chooses_larger_axis_first_when_both_are_outside_tolerance(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_required_consecutive_detections=1,
+            timeout_seconds=0.6,
+        )
+        mostly_horizontal_reticle = (
+            ReticleDetection(
+                found=True,
+                center_x=(frame.shape[1] / 2.0) + 46.0,
+                center_y=(frame.shape[0] / 2.0) + 24.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, _, _ = build_context([frame] * 10, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=0.0, dy=0.0, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=mostly_horizontal_reticle
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        self.assertIn(("key_down", context.config.controls.yaw_right), timeline)
+        self.assertNotIn(("key_down", context.config.controls.pitch_down), timeline)
+        self.assertNotIn(("key_down", context.config.controls.pitch_up), timeline)
+
+    def test_final_reticle_does_not_take_over_before_near_center_handoff(self) -> None:
         timeline: list[tuple[str, object]] = []
         frame = load_fixture("compass_filled_centered.png")
         config = AlignConfig(
             alignment_dwell_seconds=0.10,
             near_center_consensus_enabled=False,
             final_reticle_enabled=True,
+            final_reticle_track_anywhere=False,
+            final_reticle_stationary_seconds=0.0,
+            timeout_seconds=0.2,
+        )
+        reticle_read = (
+            ReticleDetection(
+                found=True,
+                center_x=(frame.shape[1] / 2.0) + 80.0,
+                center_y=frame.shape[0] / 2.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 6, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=8.0, dy=0.0, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=reticle_read
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        assert result.debug is not None
+        self.assertNotIn("final_reticle", result.debug)
+        self.assertNotEqual(result.debug["controller_outputs"]["yaw"]["mode"], "final_reticle_nudge")
+        self.assertEqual(input_adapter.active_keys, set())
+
+    def test_final_phase_waits_full_settle_window_before_second_pulse(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_required_consecutive_detections=1,
+            timeout_seconds=0.9,
+        )
+        off_center_read = (
+            ReticleDetection(
+                found=True,
+                center_x=(frame.shape[1] / 2.0) + 36.0,
+                center_y=frame.shape[0] / 2.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 10, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=0.0, dy=0.0, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=off_center_read
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.02)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        yaw_right = context.config.controls.yaw_right
+        self.assertEqual(timeline.count(("key_down", yaw_right)), 1)
+        self.assertGreaterEqual(timeline.count(("key_up", yaw_right)), 1)
+        self.assertEqual(input_adapter.active_keys, set())
+
+    def test_final_phase_confirmation_requires_two_seconds_of_valid_reticle(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_required_consecutive_detections=1,
+            timeout_seconds=0.7,
         )
         centered_reticle = (
             ReticleDetection(
@@ -791,11 +1010,68 @@ class TestAlignAction(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            context, input_adapter, _ = build_context([frame] * 6, timeline, Path(temp_dir))
-            reads = [make_marker("filled", dx=1.0, dy=-1.0, config=config)] * 6
+            context, input_adapter, _ = build_context([frame] * 8, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=0.0, dy=0.0, config=config))
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
                 "app.actions.align.detect_center_reticle", return_value=centered_reticle
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.02)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        assert result.debug is not None
+        self.assertIn("final_phase", result.debug)
+        self.assertLess(result.debug["final_phase"]["confirmation_elapsed_seconds"], config.final_phase_confirm_seconds)
+
+    def test_hollow_small_error_forces_actuation_above_engage_threshold(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            timeout_seconds=0.2,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 6, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("hollow", dx=5.8, dy=4.8, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)
+            ):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        self.assertTrue(
+            ("key_down", context.config.controls.yaw_right) in timeline
+            or ("key_down", context.config.controls.pitch_down) in timeline
+        )
+
+    def test_final_reticle_missing_falls_back_to_compass_success(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_missing_compass_fallback_seconds=0.10,
+            timeout_seconds=1.0,
+        )
+        missing_reticle = (
+            ReticleDetection(
+                found=False,
+                search_region=(700, 280, 520, 520),
+                metrics={},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 12, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=2.5, dy=-1.9, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=missing_reticle
             ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
                 result = AlignToTargetCompass(config=config).run(context)
 
@@ -803,82 +1079,309 @@ class TestAlignAction(unittest.TestCase):
         self.assertEqual(input_adapter.active_keys, set())
         assert result.debug is not None
         self.assertIn("final_reticle", result.debug)
-        self.assertTrue(result.debug["final_reticle"]["found"])
+        self.assertEqual(result.debug["final_reticle"]["handoff_blocker"], "reticle_missing_fallback_to_compass")
 
-    def test_final_reticle_stage_uses_screen_center_error_for_nudge(self) -> None:
+    def test_filled_near_center_uses_pwm_pulses_before_dwell(self) -> None:
         timeline: list[tuple[str, object]] = []
         frame = load_fixture("compass_filled_centered.png")
         config = AlignConfig(
-            alignment_dwell_seconds=0.10,
             near_center_consensus_enabled=False,
-            final_reticle_enabled=True,
+            timeout_seconds=0.25,
+            filled_pwm_start_distance_px=16.0,
+            filled_pwm_min_hold_seconds=0.03,
+            filled_pwm_max_hold_seconds=0.10,
+            filled_pwm_min_release_seconds=0.0,
+            filled_pwm_max_release_seconds=0.06,
         )
-        reticle_reads = [
-            (
-                ReticleDetection(
-                    found=True,
-                    center_x=(frame.shape[1] / 2.0) + 20.0,
-                    center_y=frame.shape[0] / 2.0,
-                    outer_radius_px=41.0,
-                    score=2.0,
-                    search_region=(700, 280, 520, 520),
-                    metrics={"score": 2.0},
-                ),
-                np.zeros((1, 1, 3), dtype=np.uint8),
-                np.zeros((1, 1), dtype=np.uint8),
-            ),
-            (
-                ReticleDetection(
-                    found=True,
-                    center_x=frame.shape[1] / 2.0,
-                    center_y=frame.shape[0] / 2.0,
-                    outer_radius_px=41.0,
-                    score=2.0,
-                    search_region=(700, 280, 520, 520),
-                    metrics={"score": 2.0},
-                ),
-                np.zeros((1, 1, 3), dtype=np.uint8),
-                np.zeros((1, 1), dtype=np.uint8),
-            ),
-            (
-                ReticleDetection(
-                    found=True,
-                    center_x=frame.shape[1] / 2.0,
-                    center_y=frame.shape[0] / 2.0,
-                    outer_radius_px=41.0,
-                    score=2.0,
-                    search_region=(700, 280, 520, 520),
-                    metrics={"score": 2.0},
-                ),
-                np.zeros((1, 1, 3), dtype=np.uint8),
-                np.zeros((1, 1), dtype=np.uint8),
-            ),
-            (
-                ReticleDetection(
-                    found=True,
-                    center_x=frame.shape[1] / 2.0,
-                    center_y=frame.shape[0] / 2.0,
-                    outer_radius_px=41.0,
-                    score=2.0,
-                    search_region=(700, 280, 520, 520),
-                    metrics={"score": 2.0},
-                ),
-                np.zeros((1, 1, 3), dtype=np.uint8),
-                np.zeros((1, 1), dtype=np.uint8),
-            ),
-        ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            context, input_adapter, _ = build_context([frame] * 6, timeline, Path(temp_dir))
-            reads = [make_marker("filled", dx=0.5, dy=-0.4, config=config)] * 6
+            context, input_adapter, _ = build_context([frame] * 10, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=4.0, dy=0.0, config=config))
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.detect_center_reticle", side_effect=reticle_reads
-            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)
+            ):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        assert result.debug is not None
+        self.assertEqual(result.debug["controller_outputs"]["yaw"]["mode"], "filled_pwm")
+        yaw_right = context.config.controls.yaw_right
+        self.assertIn(("key_down", yaw_right), timeline)
+        self.assertIn(("key_up", yaw_right), timeline)
+        self.assertEqual(input_adapter.active_keys, set())
+
+    def test_final_reticle_handoff_waits_for_stationary_window(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=2.0,
+            final_reticle_required_consecutive_detections=1,
+            timeout_seconds=7.0,
+        )
+        centered_reticle = (
+            ReticleDetection(
+                found=True,
+                center_x=frame.shape[1] / 2.0,
+                center_y=frame.shape[0] / 2.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 12, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=1.0, dy=0.5, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=centered_reticle
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.25)):
                 result = AlignToTargetCompass(config=config).run(context)
 
         self.assertTrue(result.success)
-        self.assertIn(("key_down", context.config.controls.yaw_right), timeline)
+        assert result.debug is not None
+        self.assertIn("final_reticle", result.debug)
+        self.assertTrue(result.debug["final_reticle"]["stationary_ready"])
+        self.assertTrue(result.debug["final_reticle"]["engaged"])
+        self.assertIn("final_phase", result.debug)
+        self.assertGreaterEqual(result.debug["final_phase"]["confirmation_elapsed_seconds"], config.final_phase_confirm_seconds)
+
+    def test_final_phase_model_update_changes_later_pulse_selection(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(final_phase_model_ema_alpha=1.0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, _, _ = build_context([frame], timeline, Path(temp_dir))
+            state = _create_final_phase_controller_state(config)
+
+            initial_choice = _choose_final_phase_action(
+                control_dx=24.0,
+                control_dy=0.0,
+                state=state,
+                context=context,
+                config=config,
+            )
+            episode = _FinalPhaseEpisode(
+                direction="yaw_right",
+                axis="yaw",
+                key=context.config.controls.yaw_right,
+                hold_seconds=0.09,
+                commanded_error_px=24.0,
+                predicted_residual_px=0.0,
+                started_at=0.0,
+                pulse_end_at=0.09,
+                settle_until=2.09,
+            )
+            observed_gain = _update_final_phase_model_from_episode(
+                state=state,
+                episode=episode,
+                control_dx=6.0,
+                control_dy=0.0,
+                config=config,
+            )
+            updated_choice = _choose_final_phase_action(
+                control_dx=24.0,
+                control_dy=0.0,
+                state=state,
+                context=context,
+                config=config,
+            )
+
+        self.assertGreater(observed_gain, config.final_phase_yaw_prior_px_per_second)
+        self.assertLess(updated_choice["hold_seconds"], initial_choice["hold_seconds"])
+
+    def test_final_phase_model_update_uses_actual_hold_duration_when_available(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(final_phase_model_ema_alpha=1.0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, _, _ = build_context([frame], timeline, Path(temp_dir))
+            state = _create_final_phase_controller_state(config)
+
+            episode = _FinalPhaseEpisode(
+                direction="yaw_right",
+                axis="yaw",
+                key=context.config.controls.yaw_right,
+                hold_seconds=0.09,
+                commanded_error_px=24.0,
+                predicted_residual_px=0.0,
+                started_at=0.0,
+                pulse_end_at=0.09,
+                settle_until=2.09,
+                actual_hold_seconds=0.18,
+            )
+            observed_gain = _update_final_phase_model_from_episode(
+                state=state,
+                episode=episode,
+                control_dx=6.0,
+                control_dy=0.0,
+                config=config,
+            )
+
+        self.assertAlmostEqual(observed_gain, 100.0, places=3)
+
+    def test_final_reticle_rejects_dashboard_false_lock_094309(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T094309_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T094309_align_oscillation_full.png not available")
+
+        debug, dx, dy = _detect_final_reticle(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertFalse(debug["found"])
+        self.assertIsNone(dx)
+        self.assertIsNone(dy)
+
+    def test_final_reticle_rejects_dashboard_false_lock_094319(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T094319_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T094319_align_oscillation_full.png not available")
+
+        debug, dx, dy = _detect_final_reticle(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertFalse(debug["found"])
+        self.assertIsNone(dx)
+        self.assertIsNone(dy)
+
+    def test_compass_circle_recovery_prefers_orb_consistent_with_marker_hint_095307(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T095307_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T095307_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        self.assertIsNotNone(result.marker)
+        assert result.marker is not None
+        self.assertLess(result.marker.distance, 12.0)
+
+    def test_compass_hollow_detection_tracks_small_left_orb_101035(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T101035_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T101035_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        self.assertEqual(result.status, "hollow")
+        assert result.marker is not None
+        self.assertLess(abs(result.marker.control_dx), 5.0)
+        self.assertGreater(result.marker.control_dy, 30.0)
+        self.assertLess(result.marker.distance, 45.0)
+
+    def test_compass_hollow_detection_tracks_right_shifted_orb_101049(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T101049_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T101049_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        self.assertEqual(result.status, "hollow")
+        assert result.marker is not None
+        self.assertGreater(result.marker.control_dx, 20.0)
+        self.assertLess(result.marker.control_dy, 5.0)
+        self.assertLess(result.marker.distance, 40.0)
+
+    def test_compass_hollow_detection_tracks_near_center_orb_101050(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T101050_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T101050_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        self.assertEqual(result.status, "hollow")
+        assert result.marker is not None
+        self.assertGreater(result.marker.control_dx, 5.0)
+        self.assertLess(result.marker.control_dx, 20.0)
+        self.assertLess(result.marker.control_dy, 0.0)
+        self.assertLess(result.marker.distance, 20.0)
+
+    def test_compass_recovery_prefers_left_orb_over_panel_ring_200406(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T200406_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T200406_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        self.assertEqual(result.status, "filled")
+        assert result.marker is not None
+        self.assertLess(result.marker.distance, 2.0)
+        self.assertLess(result.marker.compass_center_x, 700.0)
+        self.assertGreater(result.marker.compass_center_y, 850.0)
+
+    def test_compass_recovery_prefers_left_orb_over_center_clutter_200430(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T200430_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T200430_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        self.assertEqual(result.status, "filled")
+        assert result.marker is not None
+        self.assertLess(result.marker.distance, 3.0)
+        self.assertLess(result.marker.compass_center_x, 700.0)
+        self.assertLess(result.marker.compass_center_y, 820.0)
+
+    def test_compass_recovery_prefers_upper_right_orb_over_console_lights_200514(self) -> None:
+        frame = cv2.imread(str(REPO_ROOT / "debug_snapshots" / "20260409T200514_align_oscillation_full.png"))
+        if frame is None:
+            self.skipTest("Saved debug snapshot 20260409T200514_align_oscillation_full.png not available")
+
+        result = detect_compass_marker(frame, AlignConfig(debug_window_enabled=False))
+
+        self.assertTrue(result.is_detected)
+        self.assertEqual(result.status, "filled")
+        assert result.marker is not None
+        self.assertLess(result.marker.distance, 2.0)
+        self.assertGreater(result.marker.compass_center_x, 780.0)
+        self.assertLess(result.marker.compass_center_y, 790.0)
+
+    def test_final_phase_command_selection_handles_irregular_timing_inputs(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_required_consecutive_detections=1,
+            timeout_seconds=4.5,
+        )
+        centered_reticle = (
+            ReticleDetection(
+                found=True,
+                center_x=frame.shape[1] / 2.0,
+                center_y=frame.shape[0] / 2.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 16, timeline, Path(temp_dir))
+            reads = itertools.repeat(make_marker("filled", dx=1.0, dy=0.5, config=config))
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=centered_reticle
+            ), patch(
+                "app.actions.align.time.monotonic",
+                side_effect=SequencedMonotonic(steps=[0.03, 0.18, 0.07, 0.29, 0.05, 0.24, 0.06, 0.31], default_step=0.22),
+            ):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertTrue(result.success)
         self.assertEqual(input_adapter.active_keys, set())
 
     def test_runtime_dynamics_profile_scales_down_gain_for_fast_axis_response(self) -> None:
@@ -915,6 +1418,50 @@ class TestAlignAction(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(input_adapter.active_keys, set())
         self.assertTrue(any("align_timeout" in path.name for path in vision.saved_paths))
+
+    def test_nudge_axis_commits_pulse_until_hold_window_expires(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        input_adapter = FakeInputAdapter(timeline)
+        steering = _SteeringState(input_adapter)
+
+        first = steering.nudge_axis(
+            axis="yaw",
+            output=0.45,
+            positive_key="d",
+            negative_key="a",
+            engage_threshold=0.22,
+            release_threshold=0.08,
+            hold_seconds=0.30,
+            release_seconds=0.10,
+            now=1.0,
+        )
+        second = steering.nudge_axis(
+            axis="yaw",
+            output=-0.45,
+            positive_key="d",
+            negative_key="a",
+            engage_threshold=0.22,
+            release_threshold=0.08,
+            hold_seconds=0.30,
+            release_seconds=0.10,
+            now=1.1,
+        )
+        third = steering.nudge_axis(
+            axis="yaw",
+            output=-0.45,
+            positive_key="d",
+            negative_key="a",
+            engage_threshold=0.22,
+            release_threshold=0.08,
+            hold_seconds=0.30,
+            release_seconds=0.10,
+            now=1.31,
+        )
+
+        self.assertEqual(first["transition"], "press:d")
+        self.assertEqual(second["transition"], "pulse_hold")
+        self.assertEqual(third["transition"], "release:d")
+        self.assertEqual(timeline, [("key_down", "d"), ("key_up", "d")])
 
 
 if __name__ == "__main__":
