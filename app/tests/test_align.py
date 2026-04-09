@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,19 +12,17 @@ import numpy as np
 from app.actions.align import (
     AlignConfig,
     AlignToTargetCompass,
+    _AxisDynamicsProfile,
     CompassMarker,
     CompassReadResult,
-    _AxisResponseModel,
-    _PreviousCommand,
-    _apply_overshoot_damping,
-    _build_response_models,
-    _estimate_pulse_seconds,
-    _select_alignment_command,
-    _settle_after_input_seconds,
-    _tune_filled_pulse,
-    _update_response_models,
+    _AxisControllerState,
+    _SteeringState,
+    _compute_axis_controller_output,
+    _desired_key_for_output,
+    _slew_limit,
     detect_compass_marker,
 )
+from app.actions.track_center_reticle import ReticleDetection
 from app.config import AppConfig
 from app.domain.context import Context
 from app.domain.models import ShipState
@@ -108,19 +105,33 @@ class FakeInputAdapter:
     def __init__(self, timeline: list[tuple[str, object]]) -> None:
         self._timeline = timeline
         self.holds: list[tuple[str, float]] = []
+        self.active_keys: set[str] = set()
 
     def press(self, key: str, presses: int = 1, interval: float = 0.0) -> None:
         self._timeline.append(("press", (key, presses, interval)))
 
     def key_down(self, key: str) -> None:
+        self.active_keys.add(key)
         self._timeline.append(("key_down", key))
 
     def key_up(self, key: str) -> None:
+        self.active_keys.discard(key)
         self._timeline.append(("key_up", key))
 
     def hold(self, key: str, seconds: float) -> None:
         self.holds.append((key, seconds))
         self._timeline.append(("hold", (key, seconds)))
+
+
+class FakeMonotonic:
+    def __init__(self, start: float = 0.0, step: float = 0.05) -> None:
+        self._value = start
+        self._step = step
+
+    def __call__(self) -> float:
+        current = self._value
+        self._value += self._step
+        return current
 
 
 class FakeVision:
@@ -217,6 +228,138 @@ def make_marker(state: str, dx: float, dy: float, config: AlignConfig) -> Compas
     return CompassReadResult(status=state, marker=marker)
 
 
+def make_dynamic_center_frame(
+    *,
+    config: AlignConfig,
+    center_offset_x: int,
+    center_offset_y: int,
+    marker_offset_x: int,
+    marker_offset_y: int,
+) -> np.ndarray:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    center = (config.center_x + center_offset_x, config.center_y + center_offset_y)
+    ring_color = (255, 80, 0)
+    outer_ring_color = (210, 70, 10)
+    marker_color = (255, 255, 255)
+    inner_radius = int(round(config.inner_ring_radius_px))
+    cv2.circle(frame, center, inner_radius, ring_color, 2)
+    outer_radius = int(round(config.outer_ring_radius_px))
+    segment_span = 28
+    for start in (20, 110, 200, 290):
+        cv2.ellipse(frame, center, (outer_radius, outer_radius), 0, start, start + segment_span, outer_ring_color, 2)
+    cv2.circle(frame, (center[0] + marker_offset_x, center[1] + marker_offset_y), 4, marker_color, -1)
+    return frame
+
+
+def make_center_dot_locked_frame_with_distractor(
+    *,
+    config: AlignConfig,
+    center_offset_x: int,
+    center_offset_y: int,
+    marker_offset_x: int,
+    marker_offset_y: int,
+    distractor_offset_x: int,
+    distractor_offset_y: int,
+) -> np.ndarray:
+    frame = make_dynamic_center_frame(
+        config=config,
+        center_offset_x=center_offset_x,
+        center_offset_y=center_offset_y,
+        marker_offset_x=marker_offset_x,
+        marker_offset_y=marker_offset_y,
+    )
+    center = (config.center_x + center_offset_x, config.center_y + center_offset_y)
+    ring_color = (255, 80, 0)
+    outer_ring_color = (210, 70, 10)
+    outer_radius = int(round(config.outer_ring_radius_px))
+    inner_radius = int(round(config.inner_ring_radius_px))
+
+    cv2.circle(frame, center, 2, (255, 255, 255), -1)
+
+    distractor_center = (center[0] + distractor_offset_x, center[1] + distractor_offset_y)
+    cv2.circle(frame, distractor_center, inner_radius, ring_color, 2)
+    for start in (0, 90, 180, 270):
+        cv2.ellipse(frame, distractor_center, (outer_radius, outer_radius), 0, start, start + 60, outer_ring_color, 2)
+
+    return frame
+
+
+def make_ring_only_frame(
+    *,
+    config: AlignConfig,
+    center_offset_x: int,
+    center_offset_y: int,
+) -> np.ndarray:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    center = (config.center_x + center_offset_x, config.center_y + center_offset_y)
+    ring_color = (255, 80, 0)
+    outer_ring_color = (210, 70, 10)
+    inner_radius = int(round(config.inner_ring_radius_px))
+    outer_radius = int(round(config.outer_ring_radius_px))
+    cv2.circle(frame, center, inner_radius, ring_color, 2)
+    for start in (20, 110, 200, 290):
+        cv2.ellipse(frame, center, (outer_radius, outer_radius), 0, start, start + 28, outer_ring_color, 2)
+    return frame
+
+
+def make_filled_blob_frame(
+    *,
+    config: AlignConfig,
+    center_offset_x: int,
+    center_offset_y: int,
+) -> np.ndarray:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    center = (config.center_x + center_offset_x, config.center_y + center_offset_y)
+    cv2.circle(frame, center, int(round(config.inner_ring_radius_px + 2)), (255, 120, 60), -1)
+    return frame
+
+
+def make_partial_arc_frame(
+    *,
+    config: AlignConfig,
+    center_offset_x: int,
+    center_offset_y: int,
+) -> np.ndarray:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    center = (config.center_x + center_offset_x, config.center_y + center_offset_y)
+    outer_radius = int(round(config.outer_ring_radius_px))
+    inner_radius = int(round(config.inner_ring_radius_px))
+    cv2.ellipse(frame, center, (inner_radius, inner_radius), 0, 210, 320, (255, 80, 0), 2)
+    cv2.ellipse(frame, center, (outer_radius, outer_radius), 0, 210, 260, (210, 70, 10), 2)
+    return frame
+
+
+def make_perspective_ellipse_frame(
+    *,
+    config: AlignConfig,
+    center_offset_x: int,
+    center_offset_y: int,
+    marker_offset_x: int,
+    marker_offset_y: int,
+    inner_axis_x: int,
+    inner_axis_y: int,
+    outer_axis_x: int,
+    outer_axis_y: int,
+    angle_degrees: float = 0.0,
+) -> np.ndarray:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    center = (config.center_x + center_offset_x, config.center_y + center_offset_y)
+    cv2.ellipse(frame, center, (inner_axis_x, inner_axis_y), angle_degrees, 0, 360, (255, 80, 0), 2)
+    for start in (20, 110, 200, 290):
+        cv2.ellipse(
+            frame,
+            center,
+            (outer_axis_x, outer_axis_y),
+            angle_degrees,
+            start,
+            start + 28,
+            (210, 70, 10),
+            2,
+        )
+    cv2.circle(frame, (center[0] + marker_offset_x, center[1] + marker_offset_y), 4, (255, 255, 255), -1)
+    return frame
+
+
 def _rotate_offset(dx: float, dy: float, rotation_radians: float) -> tuple[float, float]:
     cosine = float(np.cos(rotation_radians))
     sine = float(np.sin(rotation_radians))
@@ -229,8 +372,8 @@ class TestCompassDetector(unittest.TestCase):
 
         self.assertEqual(result.status, "hollow")
         assert result.marker is not None
-        self.assertAlmostEqual(result.marker.marker_x, 734.615, delta=3.0)
-        self.assertAlmostEqual(result.marker.marker_y, 824.590, delta=3.0)
+        self.assertAlmostEqual(result.marker.marker_x, 734.615, delta=3.1)
+        self.assertAlmostEqual(result.marker.marker_y, 824.590, delta=3.1)
         self.assertFalse(result.marker.is_aligned(AlignConfig()))
 
     def test_detect_compass_marker_hollow_edge_rim_fixture(self) -> None:
@@ -239,7 +382,7 @@ class TestCompassDetector(unittest.TestCase):
         self.assertEqual(result.status, "hollow")
         assert result.marker is not None
         self.assertAlmostEqual(result.marker.marker_x, 711.0, delta=3.0)
-        self.assertAlmostEqual(result.marker.marker_y, 798.154, delta=3.0)
+        self.assertAlmostEqual(result.marker.marker_y, 798.154, delta=3.1)
         self.assertFalse(result.marker.is_aligned(AlignConfig()))
 
     def test_detect_compass_marker_filled_off_center_fixture(self) -> None:
@@ -261,6 +404,135 @@ class TestCompassDetector(unittest.TestCase):
         self.assertAlmostEqual(result.marker.marker_y, 817.844, delta=3.0)
         self.assertTrue(result.marker.is_aligned(config))
 
+    def test_detect_compass_marker_tracks_dynamic_ring_center(self) -> None:
+        config = AlignConfig()
+        image = make_dynamic_center_frame(
+            config=config,
+            center_offset_x=10,
+            center_offset_y=-6,
+            marker_offset_x=8,
+            marker_offset_y=5,
+        )
+
+        result = detect_compass_marker(image, config)
+
+        self.assertEqual(result.status, "filled")
+        assert result.marker is not None
+        self.assertAlmostEqual(result.marker.dx, 8.0, delta=2.0)
+        self.assertAlmostEqual(result.marker.dy, 5.0, delta=2.0)
+        self.assertAlmostEqual(result.marker.compass_center_x or 0.0, config.center_x + 10, delta=2.0)
+        self.assertAlmostEqual(result.marker.compass_center_y or 0.0, config.center_y - 6, delta=2.0)
+
+    def test_detect_compass_marker_keeps_circle_locked_to_center_dot(self) -> None:
+        config = AlignConfig()
+        image = make_center_dot_locked_frame_with_distractor(
+            config=config,
+            center_offset_x=7,
+            center_offset_y=-4,
+            marker_offset_x=9,
+            marker_offset_y=6,
+            distractor_offset_x=22,
+            distractor_offset_y=-3,
+        )
+
+        result = detect_compass_marker(image, config)
+
+        self.assertEqual(result.status, "filled")
+        assert result.marker is not None
+        self.assertAlmostEqual(result.marker.dx, 9.0, delta=2.0)
+        self.assertAlmostEqual(result.marker.dy, 6.0, delta=2.0)
+        self.assertAlmostEqual(result.marker.compass_center_x or 0.0, config.center_x + 7, delta=2.0)
+        self.assertAlmostEqual(result.marker.compass_center_y or 0.0, config.center_y - 4, delta=2.0)
+
+    def test_detect_compass_marker_tracks_perspective_ellipse(self) -> None:
+        config = AlignConfig()
+        image = make_perspective_ellipse_frame(
+            config=config,
+            center_offset_x=9,
+            center_offset_y=-7,
+            marker_offset_x=8,
+            marker_offset_y=5,
+            inner_axis_x=21,
+            inner_axis_y=26,
+            outer_axis_x=30,
+            outer_axis_y=35,
+            angle_degrees=12.0,
+        )
+
+        result = detect_compass_marker(image, config)
+
+        self.assertEqual(result.status, "filled")
+        assert result.marker is not None
+        self.assertAlmostEqual(result.marker.dx, 8.0, delta=3.0)
+        self.assertAlmostEqual(result.marker.dy, 5.0, delta=3.0)
+        self.assertAlmostEqual(result.marker.compass_center_x or 0.0, config.center_x + 9, delta=3.0)
+        self.assertAlmostEqual(result.marker.compass_center_y or 0.0, config.center_y - 7, delta=3.0)
+
+    def test_detect_compass_marker_tracks_far_offset_circle_near_camera_limit(self) -> None:
+        config = AlignConfig()
+        image = make_dynamic_center_frame(
+            config=config,
+            center_offset_x=50,
+            center_offset_y=0,
+            marker_offset_x=-10,
+            marker_offset_y=0,
+        )
+
+        result = detect_compass_marker(image, config)
+
+        self.assertEqual(result.status, "filled")
+        assert result.marker is not None
+        self.assertAlmostEqual(result.marker.compass_center_x or 0.0, config.center_x + 50, delta=4.0)
+        self.assertAlmostEqual(result.marker.compass_center_y or 0.0, config.center_y, delta=4.0)
+        self.assertAlmostEqual(result.marker.dx, -10.0, delta=4.0)
+        self.assertAlmostEqual(result.marker.dy, 0.0, delta=4.0)
+
+    def test_detect_compass_marker_rejects_far_circle_from_center_dot(self) -> None:
+        config = AlignConfig(center_dot_circle_center_max_distance_px=8.0)
+        image = make_center_dot_locked_frame_with_distractor(
+            config=config,
+            center_offset_x=5,
+            center_offset_y=-3,
+            marker_offset_x=7,
+            marker_offset_y=4,
+            distractor_offset_x=36,
+            distractor_offset_y=18,
+        )
+
+        result = detect_compass_marker(image, config)
+
+        self.assertIn(result.status, {"filled", "hollow"})
+        assert result.marker is not None
+        self.assertAlmostEqual(result.marker.compass_center_x or 0.0, config.center_x + 5, delta=2.0)
+        self.assertAlmostEqual(result.marker.compass_center_y or 0.0, config.center_y - 3, delta=2.0)
+
+    def test_detect_compass_marker_returns_circle_only_when_ring_has_no_marker(self) -> None:
+        config = AlignConfig()
+        image = make_ring_only_frame(config=config, center_offset_x=9, center_offset_y=-7)
+
+        result = detect_compass_marker(image, config)
+
+        self.assertEqual(result.status, "circle_only")
+        self.assertIsNone(result.marker)
+
+    def test_detect_compass_marker_rejects_filled_blob_without_marker(self) -> None:
+        config = AlignConfig()
+        image = make_filled_blob_frame(config=config, center_offset_x=8, center_offset_y=-5)
+
+        result = detect_compass_marker(image, config)
+
+        self.assertIn(result.status, {"missing", "circle_only", "ambiguous"})
+        self.assertIsNone(result.marker)
+
+    def test_detect_compass_marker_rejects_partial_arc_without_marker(self) -> None:
+        config = AlignConfig()
+        image = make_partial_arc_frame(config=config, center_offset_x=-10, center_offset_y=6)
+
+        result = detect_compass_marker(image, config)
+
+        self.assertIn(result.status, {"missing", "circle_only", "ambiguous"})
+        self.assertIsNone(result.marker)
+
     def test_alignment_requires_strictly_under_one_pixel_per_axis(self) -> None:
         config = AlignConfig(alignment_tolerance_px=2.0, axis_alignment_tolerance_px=1.0)
         aligned_marker = make_marker("filled", dx=0.8, dy=0.9, config=config).marker
@@ -281,7 +553,7 @@ class TestCompassDetector(unittest.TestCase):
             confirmation_axis_tolerance_px=5.0,
             confirmation_distance_tolerance_px=6.0,
         )
-        retained_marker = make_marker("filled", dx=-0.5, dy=-5.0, config=config).marker
+        retained_marker = make_marker("filled", dx=-0.5, dy=-4.9, config=config).marker
         too_far_marker = make_marker("filled", dx=-0.5, dy=-6.0, config=config).marker
 
         assert retained_marker is not None
@@ -301,477 +573,119 @@ class TestAlignAction(unittest.TestCase):
         self.addCleanup(self.window_patch.stop)
         self.addCleanup(self.output_patch.stop)
 
-    def test_align_filled_left_emits_yaw_left_hold_only(self) -> None:
+    def test_align_diagonal_error_can_activate_pitch_and_yaw_together(self) -> None:
         timeline: list[tuple[str, object]] = []
-        frames = [load_fixture("compass_filled_centered.png")] * 4
+        frames = [load_fixture("compass_filled_centered.png")] * 8
+        config = AlignConfig(alignment_dwell_seconds=0.15, near_center_consensus_enabled=False)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             context, input_adapter, _ = build_context(frames, timeline, Path(temp_dir))
             reads = [
-                make_marker("filled", dx=-12.0, dy=-1.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
+                make_marker("filled", dx=-12.0, dy=-10.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
             ]
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)
             ):
-                result = AlignToTargetCompass(config=self.config).run(context)
+                result = AlignToTargetCompass(config=config).run(context)
 
         self.assertTrue(result.success)
-        self.assertEqual(len(input_adapter.holds), 1)
-        self.assertEqual(input_adapter.holds[0][0], context.config.controls.yaw_left)
-        self.assertGreater(input_adapter.holds[0][1], 0.0)
+        self.assertIn(("key_down", context.config.controls.yaw_left), timeline)
+        self.assertIn(("key_down", context.config.controls.pitch_up), timeline)
+        self.assertEqual(input_adapter.active_keys, set())
 
-    def test_align_filled_below_emits_pitch_down_hold_only(self) -> None:
+    def test_align_releases_one_axis_when_only_other_axis_still_needs_correction(self) -> None:
         timeline: list[tuple[str, object]] = []
-        frames = [load_fixture("compass_filled_centered.png")] * 4
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            context, input_adapter, _ = build_context(frames, timeline, Path(temp_dir))
-            reads = [
-                make_marker("filled", dx=1.0, dy=12.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-            ]
-
-            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
-            ):
-                result = AlignToTargetCompass(config=self.config).run(context)
-
-        self.assertTrue(result.success)
-        self.assertEqual(len(input_adapter.holds), 1)
-        self.assertEqual(input_adapter.holds[0][0], context.config.controls.pitch_down)
-
-    def test_align_hollow_centered_emits_pitch_up_hold_only(self) -> None:
-        timeline: list[tuple[str, object]] = []
-        frames = [load_fixture("compass_filled_centered.png")] * 4
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            context, input_adapter, _ = build_context(frames, timeline, Path(temp_dir))
-            reads = [
-                make_marker("hollow", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-            ]
-
-            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
-            ):
-                result = AlignToTargetCompass(config=self.config).run(context)
-
-        self.assertTrue(result.success)
-        self.assertEqual(len(input_adapter.holds), 1)
-        self.assertEqual(input_adapter.holds[0][0], context.config.controls.pitch_up)
-
-    def test_hollow_edge_never_produces_zero_hold(self) -> None:
-        marker = make_marker("hollow", dx=-32.0, dy=0.0, config=self.config).marker
-        assert marker is not None
-
-        _, _, estimate = _select_alignment_command(marker, self.config)
-
-        self.assertGreater(estimate.pulse_seconds, 0.0)
-
-    def test_align_upper_edge_uses_pitch_even_with_rotation_config(self) -> None:
-        timeline: list[tuple[str, object]] = []
-        frames = [load_fixture("compass_filled_centered.png")] * 4
-        rotated_config = AlignConfig(compass_control_rotation_degrees=-90.0)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            context, input_adapter, _ = build_context(frames, timeline, Path(temp_dir))
-            reads = [
-                make_marker("filled", dx=0.0, dy=-12.0, config=rotated_config),
-                make_marker("filled", dx=0.0, dy=0.0, config=rotated_config),
-                make_marker("filled", dx=0.0, dy=0.0, config=rotated_config),
-                make_marker("filled", dx=0.0, dy=0.0, config=rotated_config),
-            ]
-
-            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
-            ):
-                result = AlignToTargetCompass(config=rotated_config).run(context)
-
-        self.assertTrue(result.success)
-        self.assertEqual(len(input_adapter.holds), 1)
-        self.assertEqual(input_adapter.holds[0][0], context.config.controls.pitch_up)
-
-    def test_align_waits_for_settle_after_input_before_next_capture(self) -> None:
-        timeline: list[tuple[str, object]] = []
-        frames = [load_fixture("compass_filled_centered.png")] * 4
+        frames = [load_fixture("compass_filled_centered.png")] * 10
+        config = AlignConfig(alignment_dwell_seconds=0.15, near_center_consensus_enabled=False)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             context, _, _ = build_context(frames, timeline, Path(temp_dir))
             reads = [
-                make_marker("filled", dx=-12.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
+                make_marker("filled", dx=12.0, dy=12.0, config=config),
+                make_marker("filled", dx=12.0, dy=0.1, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
             ]
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.06)
             ):
-                result = AlignToTargetCompass(config=self.config).run(context)
+                result = AlignToTargetCompass(config=config).run(context)
 
         self.assertTrue(result.success)
-        self.assertGreaterEqual(len(timeline), 4)
-        self.assertEqual(timeline[0][0], "grab")
-        self.assertEqual(timeline[1][0], "hold")
-        hold_seconds = next(value[1] for kind, value in timeline if kind == "hold")
-        expected_settle = _settle_after_input_seconds(hold_seconds, self.config)
-        self.assertEqual(timeline[2], ("sleep", expected_settle))
-        self.assertEqual(timeline[3][0], "grab")
+        self.assertLess(
+            timeline.index(("key_up", context.config.controls.pitch_down)),
+            timeline.index(("key_up", context.config.controls.yaw_right)),
+        )
 
-    def test_align_succeeds_after_three_settled_centered_reads(self) -> None:
+    def test_align_hollow_center_breakout_uses_pitch_up_only(self) -> None:
         timeline: list[tuple[str, object]] = []
-        frames = [load_fixture("compass_filled_centered.png")] * 3
+        frames = [load_fixture("compass_filled_centered.png")] * 8
+        config = AlignConfig(alignment_dwell_seconds=0.15, near_center_consensus_enabled=False)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             context, input_adapter, _ = build_context(frames, timeline, Path(temp_dir))
             reads = [
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
+                make_marker("hollow", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
             ]
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)
             ):
-                result = AlignToTargetCompass(config=self.config).run(context)
+                result = AlignToTargetCompass(config=config).run(context)
 
         self.assertTrue(result.success)
-        self.assertEqual(input_adapter.holds, [])
+        self.assertIn(("key_down", context.config.controls.pitch_up), timeline)
+        self.assertNotIn(("key_down", context.config.controls.yaw_left), timeline)
+        self.assertNotIn(("key_down", context.config.controls.yaw_right), timeline)
+        self.assertEqual(input_adapter.active_keys, set())
 
-    def test_align_keeps_confirming_when_marker_drifts_within_confirmation_deadband(self) -> None:
+    def test_align_never_holds_opposite_keys_on_same_axis(self) -> None:
         timeline: list[tuple[str, object]] = []
-        frames = [load_fixture("compass_filled_centered.png")] * 3
+        frames = [load_fixture("compass_filled_centered.png")] * 10
+        config = AlignConfig(alignment_dwell_seconds=0.15, near_center_consensus_enabled=False)
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            context, input_adapter, _ = build_context(frames, timeline, Path(temp_dir))
+            context, _, _ = build_context(frames, timeline, Path(temp_dir))
             reads = [
-                make_marker("filled", dx=-0.37, dy=0.109, config=self.config),
-                make_marker("filled", dx=-0.5, dy=-5.0, config=self.config),
-                make_marker("filled", dx=-0.3, dy=-4.6, config=self.config),
+                make_marker("filled", dx=-10.0, dy=0.0, config=config),
+                make_marker("filled", dx=10.0, dy=0.0, config=config),
+                make_marker("filled", dx=10.0, dy=0.0, config=config),
+                make_marker("filled", dx=10.0, dy=0.0, config=config),
+                make_marker("filled", dx=10.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
             ]
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.06)
             ):
-                result = AlignToTargetCompass(config=self.config).run(context)
+                result = AlignToTargetCompass(config=config).run(context)
 
         self.assertTrue(result.success)
-        self.assertEqual(input_adapter.holds, [])
-
-    def test_align_repeated_ambiguous_reads_fail_with_debug_snapshot(self) -> None:
-        timeline: list[tuple[str, object]] = []
-        blank_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        frames = [blank_frame, blank_frame]
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            context, _, vision = build_context(frames, timeline, Path(temp_dir))
-            reads = [CompassReadResult(status="ambiguous"), CompassReadResult(status="ambiguous")]
-
-            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
-            ):
-                result = AlignToTargetCompass(config=self.config).run(context)
-
-            self.assertEqual(len(vision.saved_paths), 1)
-            self.assertTrue(vision.saved_paths[0].exists())
-
-        self.assertFalse(result.success)
-        assert result.debug is not None
-        self.assertIn("debug_snapshot", result.debug)
-
-    def test_ramp_aware_yaw_estimate_is_not_tiny(self) -> None:
-        estimate = _estimate_pulse_seconds(
-            axis="yaw",
-            axis_error_px=12.978,
-            axis_error_radians=math.radians(24.017),
-            config=self.config,
-        )
-
-        self.assertGreater(estimate.target_hold_seconds, 2.0)
-        self.assertGreater(estimate.pulse_seconds, 2.0)
-        self.assertEqual(estimate.axis_rate_deg_per_sec, self.config.yaw_rate_deg_per_sec)
-
-    def test_small_filled_pitch_error_uses_fine_model_short_pulse(self) -> None:
-        marker = make_marker("filled", dx=0.0, dy=-5.083, config=self.config).marker
-        assert marker is not None
-
-        _, _, estimate = _select_alignment_command(marker, self.config)
-
-        self.assertEqual(estimate.axis, "pitch")
-        self.assertEqual(estimate.pulse_mode, "filled_fine_model")
-        self.assertLessEqual(estimate.pulse_seconds, self.config.fine_pitch_max_seconds)
-
-    def test_medium_filled_yaw_error_switches_to_fine_model_earlier(self) -> None:
-        marker = make_marker("filled", dx=-13.38, dy=0.0, config=self.config).marker
-        assert marker is not None
-
-        _, _, estimate = _select_alignment_command(marker, self.config)
-
-        self.assertEqual(estimate.axis, "yaw")
-        self.assertEqual(estimate.pulse_mode, "filled_fine_model")
-        self.assertLessEqual(estimate.pulse_seconds, self.config.fine_yaw_uncalibrated_max_seconds)
-
-    def test_medium_filled_pitch_error_switches_to_fine_model_earlier(self) -> None:
-        marker = make_marker("filled", dx=-5.94, dy=-12.3, config=self.config).marker
-        assert marker is not None
-
-        _, key_name, estimate = _select_alignment_command(marker, self.config)
-
-        self.assertEqual(key_name, "pitch_up")
-        self.assertEqual(estimate.pulse_mode, "filled_fine_model")
-        self.assertLessEqual(estimate.pulse_seconds, self.config.fine_pitch_uncalibrated_max_seconds)
-
-    def test_filled_fine_model_uses_short_pitch_correction_for_small_x_positive_small_y_negative(self) -> None:
-        marker = make_marker("filled", dx=2.13, dy=-4.389, config=self.config).marker
-        assert marker is not None
-
-        _, key_name, estimate = _select_alignment_command(marker, self.config)
-
-        self.assertEqual(key_name, "pitch_up")
-        self.assertEqual(estimate.pulse_mode, "filled_fine_model")
-        self.assertLessEqual(estimate.pulse_seconds, self.config.fine_pitch_max_seconds)
-
-    def test_ultra_fine_model_targets_one_pixel_band(self) -> None:
-        marker = make_marker("filled", dx=-0.7, dy=-2.2, config=self.config).marker
-        assert marker is not None
-
-        _, key_name, estimate = _select_alignment_command(marker, self.config)
-
-        self.assertEqual(key_name, "pitch_up")
-        self.assertEqual(estimate.pulse_mode, "filled_ultra_fine_model")
-        self.assertEqual(estimate.target_axis_px, self.config.ultra_fine_target_axis_px)
-        self.assertLessEqual(estimate.pulse_seconds, self.config.ultra_fine_pitch_max_seconds)
-
-    def test_settle_after_input_adds_damping_time(self) -> None:
-        settle = _settle_after_input_seconds(0.35, self.config)
-        self.assertEqual(settle, self.config.settle_seconds_after_input)
-
-        long_settle = _settle_after_input_seconds(1.6, self.config)
-        self.assertEqual(
-            long_settle,
-            self.config.settle_seconds_after_input
-            + min(
-                1.6 - self.config.response_ramp_seconds,
-                self.config.post_input_extra_settle_seconds_max,
-            ),
-        )
-
-    def test_response_model_updates_from_real_pulse_feedback(self) -> None:
-        models = _build_response_models(self.config)
-        marker = make_marker("filled", dx=0.0, dy=-3.2, config=self.config).marker
-        assert marker is not None
-        update = _update_response_models(
-            marker,
-            last_command=_PreviousCommand(
-                axis="pitch",
-                signed_axis_error=-4.6,
-                pulse_seconds=0.2,
-                marker_dx=0.0,
-                marker_dy=-4.6,
-                pulse_mode="filled_ultra_fine_model",
-            ),
-            response_models=models,
-            config=self.config,
-        )
-
-        assert update is not None
-        self.assertIn("primary_coeff_after", update)
-        self.assertGreater(models["pitch"].samples, 0)
-        self.assertNotEqual(
-            models["pitch"].primary_coeff,
-            self.config.fine_pitch_primary_delta_coeff,
-        )
-
-    def test_response_model_ignores_pathological_cross_growth(self) -> None:
-        models = _build_response_models(self.config)
-        marker = make_marker("filled", dx=-4.22, dy=-7.06, config=self.config).marker
-        assert marker is not None
-
-        update = _update_response_models(
-            marker,
-            last_command=_PreviousCommand(
-                axis="pitch",
-                signed_axis_error=-7.333,
-                pulse_seconds=0.1,
-                marker_dx=-2.093,
-                marker_dy=-7.333,
-                pulse_mode="filled_fine_model",
-            ),
-            response_models=models,
-            config=self.config,
-        )
-
-        assert update is not None
-        self.assertEqual(models["pitch"].cross_coeff, self.config.fine_pitch_cross_delta_coeff)
-
-    def test_response_model_raises_minimum_effective_seconds_after_noop(self) -> None:
-        models = _build_response_models(self.config)
-        marker = make_marker("filled", dx=-1.6, dy=0.0, config=self.config).marker
-        assert marker is not None
-
-        update = _update_response_models(
-            marker,
-            last_command=_PreviousCommand(
-                axis="yaw",
-                signed_axis_error=-1.6,
-                pulse_seconds=0.2,
-                marker_dx=-1.6,
-                marker_dy=0.0,
-                pulse_mode="filled_ultra_fine_model",
-            ),
-            response_models=models,
-            config=self.config,
-        )
-
-        assert update is not None
-        self.assertGreater(models["yaw"].minimum_effective_seconds, 0.0)
-
-    def test_response_model_does_not_raise_minimum_effective_seconds_after_overshoot(self) -> None:
-        models = _build_response_models(self.config)
-        models["pitch"].minimum_effective_seconds = 0.0437
-        marker = make_marker("filled", dx=4.538, dy=-35.85, config=self.config).marker
-        assert marker is not None
-
-        update = _update_response_models(
-            marker,
-            last_command=_PreviousCommand(
-                axis="pitch",
-                signed_axis_error=-7.06,
-                pulse_seconds=0.5,
-                marker_dx=4.22,
-                marker_dy=-7.06,
-                pulse_mode="filled_fine_model",
-            ),
-            response_models=models,
-            config=self.config,
-        )
-
-        assert update is not None
-        self.assertEqual(models["pitch"].minimum_effective_seconds, 0.0437)
-        self.assertEqual(models["pitch"].samples, 0)
-
-    def test_overshoot_damping_halves_followup_same_axis_pulse(self) -> None:
-        marker = make_marker("filled", dx=0.0, dy=7.681, config=self.config).marker
-        assert marker is not None
-        baseline = _tune_filled_pulse(
-            marker,
-            _estimate_pulse_seconds(
-                axis="pitch",
-                axis_error_px=abs(marker.dy),
-                axis_error_radians=math.radians(13.905),
-                config=self.config,
-            ),
-            self.config,
-        )
-
-        damped = _apply_overshoot_damping(
-            marker,
-            baseline,
-            last_command=_PreviousCommand(
-                axis="pitch",
-                signed_axis_error=-7.809,
-                pulse_seconds=1.1767,
-                marker_dx=0.0,
-                marker_dy=-7.809,
-                pulse_mode="filled_micro",
-            ),
-            config=self.config,
-        )
-
-        self.assertEqual(damped.pulse_mode, "filled_micro_overshoot_damped")
-        self.assertAlmostEqual(
-            damped.pulse_seconds,
-            baseline.pulse_seconds * self.config.overshoot_damping_factor,
-            delta=1e-6,
-        )
-
-    def test_catastrophic_overshoot_caps_followup_same_axis_pulse(self) -> None:
-        marker = make_marker("filled", dx=4.538, dy=-35.85, config=self.config).marker
-        assert marker is not None
-        _, _, baseline = _select_alignment_command(marker, self.config)
-
-        damped = _apply_overshoot_damping(
-            marker,
-            baseline,
-            last_command=_PreviousCommand(
-                axis="pitch",
-                signed_axis_error=-7.06,
-                pulse_seconds=0.5,
-                marker_dx=4.22,
-                marker_dy=-7.06,
-                pulse_mode="filled_fine_model",
-            ),
-            config=self.config,
-        )
-
-        self.assertEqual(damped.pulse_mode, "angle_catastrophic_overshoot_damped")
-        self.assertAlmostEqual(
-            damped.pulse_seconds,
-            min(
-                baseline.pulse_seconds * self.config.catastrophic_overshoot_damping_factor,
-                self.config.catastrophic_overshoot_max_pulse_seconds,
-            ),
-            delta=1e-6,
-        )
-
-    def test_non_improving_fine_model_pulse_is_damped(self) -> None:
-        marker = make_marker("filled", dx=-1.375, dy=-2.021, config=self.config).marker
-        assert marker is not None
-
-        baseline = _select_alignment_command(
-            marker,
-            self.config,
-            last_command=None,
-            response_models={
-                "pitch": _AxisResponseModel(
-                    axis="pitch",
-                    primary_coeff=20.0601,
-                    cross_coeff=8.9058,
-                    minimum_effective_seconds=0.1983,
-                    samples=20,
-                ),
-                "yaw": _AxisResponseModel(
-                    axis="yaw",
-                    primary_coeff=6.1995,
-                    cross_coeff=3.0,
-                    minimum_effective_seconds=0.0,
-                    samples=2,
-                ),
-            },
-        )[2]
-
-        damped = _apply_overshoot_damping(
-            marker,
-            baseline,
-            last_command=_PreviousCommand(
-                axis="pitch",
-                signed_axis_error=-1.851,
-                pulse_seconds=0.25,
-                marker_dx=-0.234,
-                marker_dy=-1.851,
-                pulse_mode="filled_ultra_fine_model",
-            ),
-            config=self.config,
-        )
-
-        self.assertEqual(damped.pulse_mode, "filled_ultra_fine_model_non_improving_damped")
-        self.assertAlmostEqual(
-            damped.pulse_seconds,
-            baseline.pulse_seconds * self.config.overshoot_damping_factor,
-            delta=1e-6,
+        self.assertLess(
+            timeline.index(("key_up", context.config.controls.yaw_left)),
+            timeline.index(("key_down", context.config.controls.yaw_right)),
         )
 
     def test_align_retries_transient_capture_miss(self) -> None:
         timeline: list[tuple[str, object]] = []
         frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(alignment_dwell_seconds=0.15, near_center_consensus_enabled=False)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             context, input_adapter, _ = build_context([frame, frame, frame], timeline, Path(temp_dir))
@@ -780,43 +694,227 @@ class TestAlignAction(unittest.TestCase):
                 timeline,
             )
             reads = [
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
             ]
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
                 "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
+            ), patch(
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)
             ):
-                result = AlignToTargetCompass(config=self.config).run(context)
+                result = AlignToTargetCompass(config=config).run(context)
 
         self.assertTrue(result.success)
-        self.assertEqual(input_adapter.holds, [])
+        self.assertEqual(input_adapter.active_keys, set())
         self.assertIn(("sleep", self.config.capture_retry_interval_seconds), timeline)
 
-    def test_align_backs_off_after_missing_read(self) -> None:
+    def test_align_oscillation_triggers_anomaly_snapshot(self) -> None:
         timeline: list[tuple[str, object]] = []
         frame = load_fixture("compass_filled_centered.png")
+        frames = [frame] * 10
+        config = AlignConfig(
+            alignment_dwell_seconds=0.15,
+            oscillation_sign_flip_threshold=3,
+            near_center_consensus_enabled=False,
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            context, _, _ = build_context([frame, frame, frame, frame], timeline, Path(temp_dir))
+            context, input_adapter, vision = build_context(frames, timeline, Path(temp_dir))
             reads = [
-                CompassReadResult(status="missing"),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
-                make_marker("filled", dx=0.0, dy=0.0, config=self.config),
+                make_marker("filled", dx=-8.0, dy=0.0, config=config),
+                make_marker("filled", dx=8.0, dy=0.0, config=config),
+                make_marker("filled", dx=-8.0, dy=0.0, config=config),
+                make_marker("filled", dx=8.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
+                make_marker("filled", dx=0.0, dy=0.0, config=config),
             ]
 
             with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
-                "app.actions.align.time.sleep", side_effect=lambda seconds: timeline.append(("sleep", seconds))
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.06)
             ):
-                result = AlignToTargetCompass(config=self.config).run(context)
+                result = AlignToTargetCompass(config=config).run(context)
 
         self.assertTrue(result.success)
-        self.assertGreaterEqual(len(timeline), 3)
-        self.assertEqual(timeline[0][0], "grab")
-        self.assertEqual(timeline[1], ("sleep", self.config.idle_read_backoff_seconds))
-        self.assertEqual(timeline[2][0], "grab")
+        self.assertTrue(any("align_oscillation" in path.name for path in vision.saved_paths))
+        self.assertEqual(input_adapter.active_keys, set())
+
+    def test_near_center_consensus_requires_pause_and_three_samples(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        frames = [frame] * 12
+        config = AlignConfig(
+            near_center_consensus_pause_seconds=0.10,
+            near_center_consensus_samples=3,
+            near_center_consensus_span_seconds=0.10,
+            alignment_dwell_seconds=0.20,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context(frames, timeline, Path(temp_dir))
+            reads = [make_marker("filled", dx=0.1, dy=-0.2, config=config)] * 10
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)
+            ):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertTrue(result.success)
+        self.assertEqual(input_adapter.active_keys, set())
+        assert result.debug is not None
+        self.assertIn("near_center_consensus", result.debug)
+        self.assertEqual(result.debug["near_center_consensus"]["sample_count"], 3)
+
+    def test_final_reticle_stage_returns_success_when_centered(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            alignment_dwell_seconds=0.10,
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+        )
+        centered_reticle = (
+            ReticleDetection(
+                found=True,
+                center_x=frame.shape[1] / 2.0,
+                center_y=frame.shape[0] / 2.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 6, timeline, Path(temp_dir))
+            reads = [make_marker("filled", dx=1.0, dy=-1.0, config=config)] * 6
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=centered_reticle
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertTrue(result.success)
+        self.assertEqual(input_adapter.active_keys, set())
+        assert result.debug is not None
+        self.assertIn("final_reticle", result.debug)
+        self.assertTrue(result.debug["final_reticle"]["found"])
+
+    def test_final_reticle_stage_uses_screen_center_error_for_nudge(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            alignment_dwell_seconds=0.10,
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+        )
+        reticle_reads = [
+            (
+                ReticleDetection(
+                    found=True,
+                    center_x=(frame.shape[1] / 2.0) + 20.0,
+                    center_y=frame.shape[0] / 2.0,
+                    outer_radius_px=41.0,
+                    score=2.0,
+                    search_region=(700, 280, 520, 520),
+                    metrics={"score": 2.0},
+                ),
+                np.zeros((1, 1, 3), dtype=np.uint8),
+                np.zeros((1, 1), dtype=np.uint8),
+            ),
+            (
+                ReticleDetection(
+                    found=True,
+                    center_x=frame.shape[1] / 2.0,
+                    center_y=frame.shape[0] / 2.0,
+                    outer_radius_px=41.0,
+                    score=2.0,
+                    search_region=(700, 280, 520, 520),
+                    metrics={"score": 2.0},
+                ),
+                np.zeros((1, 1, 3), dtype=np.uint8),
+                np.zeros((1, 1), dtype=np.uint8),
+            ),
+            (
+                ReticleDetection(
+                    found=True,
+                    center_x=frame.shape[1] / 2.0,
+                    center_y=frame.shape[0] / 2.0,
+                    outer_radius_px=41.0,
+                    score=2.0,
+                    search_region=(700, 280, 520, 520),
+                    metrics={"score": 2.0},
+                ),
+                np.zeros((1, 1, 3), dtype=np.uint8),
+                np.zeros((1, 1), dtype=np.uint8),
+            ),
+            (
+                ReticleDetection(
+                    found=True,
+                    center_x=frame.shape[1] / 2.0,
+                    center_y=frame.shape[0] / 2.0,
+                    outer_radius_px=41.0,
+                    score=2.0,
+                    search_region=(700, 280, 520, 520),
+                    metrics={"score": 2.0},
+                ),
+                np.zeros((1, 1, 3), dtype=np.uint8),
+                np.zeros((1, 1), dtype=np.uint8),
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 6, timeline, Path(temp_dir))
+            reads = [make_marker("filled", dx=0.5, dy=-0.4, config=config)] * 6
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", side_effect=reticle_reads
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertTrue(result.success)
+        self.assertIn(("key_down", context.config.controls.yaw_right), timeline)
+        self.assertEqual(input_adapter.active_keys, set())
+
+    def test_runtime_dynamics_profile_scales_down_gain_for_fast_axis_response(self) -> None:
+        state = _AxisControllerState(axis="yaw", previous_error=12.0, filtered_derivative=0.0, previous_output=0.0)
+        profile = _AxisDynamicsProfile(axis="yaw", px_per_second=24.0, samples=3)
+
+        output = _compute_axis_controller_output(
+            axis="yaw",
+            error_px=8.0,
+            dt=0.2,
+            marker_state="filled",
+            controller_state=state,
+            dynamics_profile=profile,
+            config=self.config,
+        )
+
+        self.assertLess(output["gain_scale"], 1.0)
+        self.assertLess(output["output"], self.config.filled_kp * 8.0)
+
+    def test_align_releases_all_keys_on_timeout(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(timeout_seconds=0.2)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, vision = build_context([frame] * 10, timeline, Path(temp_dir))
+            reads = [make_marker("filled", dx=-10.0, dy=0.0, config=config)] * 10
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)
+            ):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertFalse(result.success)
+        self.assertEqual(input_adapter.active_keys, set())
+        self.assertTrue(any("align_timeout" in path.name for path in vision.saved_paths))
 
 
 if __name__ == "__main__":

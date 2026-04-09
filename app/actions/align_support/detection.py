@@ -1,0 +1,1057 @@
+from __future__ import annotations
+
+from functools import lru_cache
+import math
+from typing import Any
+
+import cv2
+import numpy as np
+
+from app.actions.align_support.models import AlignConfig, CompassMarker, CompassReadResult
+from app.domain.protocols import Region
+
+
+def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
+    if image is None:
+        return CompassReadResult(status="missing")
+
+    roi = _extract_roi(image, config.roi_region())
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    marker_mask = _build_marker_mask(roi, hsv, config)
+    mask_closed = cv2.morphologyEx(marker_mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+    fallback_mask = _build_fallback_warm_mask(hsv, config)
+
+    # Phase 1: detect the center dot independently.
+    center_dot_hint = _detect_compass_center_dot(mask_closed, hsv, fallback_mask, config)
+
+    # Phase 2: detect the compass circle independently of the dot hint.
+    circle = _detect_compass_circle(
+        roi,
+        hsv,
+        config,
+        center_hint_x=None if center_dot_hint is None else center_dot_hint[0],
+        center_hint_y=None if center_dot_hint is None else center_dot_hint[1],
+    )
+    if circle is None:
+        return CompassReadResult(status="missing")
+
+    compass_center_local_x = circle["center_x"]
+    compass_center_local_y = circle["center_y"]
+    compass_radius_estimate = circle["radius"]
+
+    # Phase 3: detect the marker relative to the finalized circle center.
+    marker_detection = _detect_compass_marker_relative_to_circle(
+        primary_mask=mask_closed,
+        fallback_mask=fallback_mask,
+        hsv=hsv,
+        config=config,
+        local_center_x=compass_center_local_x,
+        local_center_y=compass_center_local_y,
+    )
+    if marker_detection["status"] == "circle_only":
+        return CompassReadResult(status="circle_only")
+    if marker_detection["status"] != "detected":
+        return CompassReadResult(status=str(marker_detection["status"]))
+
+    state = str(marker_detection["marker_state"])
+    marker_local_x = float(marker_detection["marker_x"])
+    marker_local_y = float(marker_detection["marker_y"])
+    inner_occupancy = float(marker_detection["inner_occupancy"])
+    outer_ring_occupancy = float(marker_detection["outer_ring_occupancy"])
+    candidate_area = int(marker_detection["area"])
+
+    marker_x = config.roi_region()[0] + marker_local_x
+    marker_y = config.roi_region()[1] + marker_local_y
+    compass_center_x = config.roi_region()[0] + compass_center_local_x
+    compass_center_y = config.roi_region()[1] + compass_center_local_y
+    dx = marker_x - compass_center_x
+    dy = marker_y - compass_center_y
+    control_dx, control_dy = _rotate_offset(dx, dy, config.compass_control_rotation_radians)
+    distance = math.hypot(dx, dy)
+    normalized_radius = min(1.0, distance / max(compass_radius_estimate, 1.0))
+    front_semisphere_radians = math.asin(normalized_radius)
+    if state == "filled":
+        target_off_boresight_radians = front_semisphere_radians
+        phase_adjustment_radians = front_semisphere_radians
+    else:
+        target_off_boresight_radians = math.pi - front_semisphere_radians
+        phase_adjustment_radians = max(0.0, (math.pi / 2.0) - front_semisphere_radians)
+
+    marker = CompassMarker(
+        marker_state=state,
+        marker_x=marker_x,
+        marker_y=marker_y,
+        dx=dx,
+        dy=dy,
+        control_dx=control_dx,
+        control_dy=control_dy,
+        distance=distance,
+        normalized_radius=normalized_radius,
+        front_semisphere_radians=front_semisphere_radians,
+        target_off_boresight_radians=target_off_boresight_radians,
+        phase_adjustment_radians=phase_adjustment_radians,
+        component_area=candidate_area,
+        inner_occupancy=inner_occupancy,
+        outer_ring_occupancy=outer_ring_occupancy,
+        roi_region=config.roi_region(),
+        compass_center_x=compass_center_x,
+        compass_center_y=compass_center_y,
+        compass_radius_estimate_px=compass_radius_estimate,
+    )
+    return CompassReadResult(status=state, marker=marker)
+
+
+def _detect_compass_marker_relative_to_circle(
+    *,
+    primary_mask: np.ndarray,
+    fallback_mask: np.ndarray,
+    hsv: np.ndarray,
+    config: AlignConfig,
+    local_center_x: float,
+    local_center_y: float,
+) -> dict[str, float | str]:
+    mask = primary_mask
+    candidates = _candidate_components(
+        primary_mask,
+        hsv,
+        config,
+        local_center_x=local_center_x,
+        local_center_y=local_center_y,
+    )
+    if not candidates:
+        mask = fallback_mask
+        candidates = _candidate_components(
+            fallback_mask,
+            hsv,
+            config,
+            local_center_x=local_center_x,
+            local_center_y=local_center_y,
+        )
+    if not candidates:
+        return {"status": "circle_only"}
+
+    best_detection: dict[str, float | str] | None = None
+    best_score = float("-inf")
+    saw_ambiguous = False
+
+    for candidate in candidates:
+        centroid_x = candidate["centroid_x"]
+        centroid_y = candidate["centroid_y"]
+        mean_value = candidate["mean_value"]
+        distance_to_circle = math.hypot(centroid_x - local_center_x, centroid_y - local_center_y)
+        inner_occupancy, outer_ring_occupancy = _occupancy_scores(
+            mask,
+            centroid_x,
+            centroid_y,
+            config,
+        )
+        refined = _refine_hollow_center(mask, centroid_x, centroid_y, config)
+        if (
+            inner_occupancy >= config.filled_inner_occupancy_threshold
+            and inner_occupancy >= config.definitive_filled_inner_occupancy_threshold
+        ):
+            filled_score = (
+                (inner_occupancy * 6.0)
+                + (outer_ring_occupancy * 1.5)
+                - (distance_to_circle * 0.05)
+                + (mean_value * 0.01)
+            )
+            if filled_score > best_score:
+                best_score = filled_score
+                best_detection = {
+                    "status": "detected",
+                    "marker_state": "filled",
+                    "marker_x": centroid_x,
+                    "marker_y": centroid_y,
+                    "inner_occupancy": inner_occupancy,
+                    "outer_ring_occupancy": outer_ring_occupancy,
+                    "area": candidate["area"],
+                }
+        elif refined is not None:
+            refined_distance = math.hypot(centroid_x - local_center_x, centroid_y - local_center_y)
+            hollow_score = (
+                (refined["outer_ring_occupancy"] * 7.0)
+                - (refined["inner_occupancy"] * 5.5)
+                - (refined_distance * 0.05)
+                + (mean_value * 0.01)
+                + 0.5
+            )
+            if hollow_score > best_score:
+                best_score = hollow_score
+                best_detection = {
+                    "status": "detected",
+                    "marker_state": "hollow",
+                    "marker_x": centroid_x,
+                    "marker_y": centroid_y,
+                    "inner_occupancy": refined["inner_occupancy"],
+                    "outer_ring_occupancy": refined["outer_ring_occupancy"],
+                    "area": candidate["area"],
+                }
+        elif inner_occupancy >= config.filled_inner_occupancy_threshold:
+            filled_score = (
+                (inner_occupancy * 5.5)
+                + (outer_ring_occupancy * 1.5)
+                - (distance_to_circle * 0.05)
+                + (mean_value * 0.01)
+            )
+            if filled_score > best_score:
+                best_score = filled_score
+                best_detection = {
+                    "status": "detected",
+                    "marker_state": "filled",
+                    "marker_x": centroid_x,
+                    "marker_y": centroid_y,
+                    "inner_occupancy": inner_occupancy,
+                    "outer_ring_occupancy": outer_ring_occupancy,
+                    "area": candidate["area"],
+                }
+        elif outer_ring_occupancy > 0.0:
+            saw_ambiguous = True
+
+    if best_detection is not None:
+        return best_detection
+    if saw_ambiguous:
+        return {"status": "ambiguous"}
+    return {"status": "circle_only"}
+
+
+def _build_marker_mask(roi: np.ndarray, hsv: np.ndarray, config: AlignConfig) -> np.ndarray:
+    warm_mask = cv2.inRange(
+        hsv,
+        np.array([config.warm_h_min, config.warm_s_min, config.warm_v_min], dtype=np.uint8),
+        np.array([config.warm_h_max, 255, 255], dtype=np.uint8),
+    )
+
+    blue_channel, green_channel, red_channel = cv2.split(roi)
+    blue_minus_red = blue_channel.astype(np.int16) - red_channel.astype(np.int16)
+    green_minus_red = green_channel.astype(np.int16) - red_channel.astype(np.int16)
+    pale_mask = cv2.inRange(
+        hsv,
+        np.array([0, 0, config.pale_v_min], dtype=np.uint8),
+        np.array([config.pale_h_max, config.pale_s_max, 255], dtype=np.uint8),
+    )
+    pale_mask = np.logical_and(
+        pale_mask > 0,
+        np.logical_and.reduce(
+            (
+                red_channel >= config.pale_red_min,
+                green_channel >= config.pale_green_min,
+                blue_minus_red <= config.pale_blue_red_delta_max,
+                green_minus_red <= config.pale_green_red_delta_max,
+            )
+        ),
+    )
+
+    return np.where(np.logical_or(warm_mask > 0, pale_mask), 255, 0).astype(np.uint8)
+
+
+def _build_fallback_warm_mask(hsv: np.ndarray, config: AlignConfig) -> np.ndarray:
+    return cv2.inRange(
+        hsv,
+        np.array([0, config.fallback_warm_s_min, config.fallback_warm_v_min], dtype=np.uint8),
+        np.array([config.warm_h_max, 255, 255], dtype=np.uint8),
+    )
+
+
+def _detect_compass_center_dot(
+    mask: np.ndarray,
+    hsv: np.ndarray,
+    fallback_mask: np.ndarray,
+    config: AlignConfig,
+) -> tuple[float, float] | None:
+    anchor_x = mask.shape[1] / 2.0
+    anchor_y = mask.shape[0] / 2.0
+    best_candidate = _find_center_dot_candidate(
+        mask,
+        hsv,
+        anchor_x,
+        anchor_y,
+        config,
+        search_radius_px=config.center_dot_search_radius_px,
+    )
+    if best_candidate is None:
+        best_candidate = _find_center_dot_candidate(
+            fallback_mask,
+            hsv,
+            anchor_x,
+            anchor_y,
+            config,
+            search_radius_px=config.center_dot_search_radius_px,
+        )
+    expanded_search_radius = min(max(mask.shape[0], mask.shape[1]) / 2.0, config.max_marker_distance_px)
+    if best_candidate is None and expanded_search_radius > config.center_dot_search_radius_px:
+        best_candidate = _find_center_dot_candidate(
+            mask,
+            hsv,
+            anchor_x,
+            anchor_y,
+            config,
+            search_radius_px=expanded_search_radius,
+        )
+    if best_candidate is None and expanded_search_radius > config.center_dot_search_radius_px:
+        best_candidate = _find_center_dot_candidate(
+            fallback_mask,
+            hsv,
+            anchor_x,
+            anchor_y,
+            config,
+            search_radius_px=expanded_search_radius,
+        )
+    if best_candidate is None:
+        return None
+    return best_candidate["x"], best_candidate["y"]
+
+
+def _find_center_dot_candidate(
+    mask: np.ndarray,
+    hsv: np.ndarray,
+    anchor_x: float,
+    anchor_y: float,
+    config: AlignConfig,
+    *,
+    search_radius_px: float,
+) -> dict[str, float] | None:
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    best_candidate: dict[str, float] | None = None
+    best_key: tuple[float, float, float] | None = None
+
+    for index in range(1, num_labels):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < config.center_dot_min_area or area > config.center_dot_max_area:
+            continue
+
+        centroid_x = float(centroids[index][0])
+        centroid_y = float(centroids[index][1])
+        distance = math.hypot(centroid_x - anchor_x, centroid_y - anchor_y)
+        if distance > search_radius_px:
+            continue
+
+        component_mask = labels == index
+        mean_value = float(hsv[:, :, 2][component_mask].mean()) if np.any(component_mask) else 0.0
+        distance_weight = distance if search_radius_px <= config.center_dot_search_radius_px else (distance * 0.35)
+        candidate = {
+            "x": centroid_x,
+            "y": centroid_y,
+            "distance": distance,
+            "area": float(area),
+            "mean_value": mean_value,
+        }
+        candidate_key = (distance_weight, -mean_value, -float(area))
+        if best_key is None or candidate_key < best_key:
+            best_key = candidate_key
+            best_candidate = candidate
+
+    return best_candidate
+
+
+def _circle_search_bounds(
+    width: int,
+    height: int,
+    center_x: float,
+    center_y: float,
+    expected_radius: float,
+    config: AlignConfig,
+    *,
+    max_center_error_px: float | None = None,
+) -> tuple[int, int, int, int]:
+    center_tolerance = (
+        max(0.0, max_center_error_px)
+        if max_center_error_px is not None
+        else max(0.0, config.circle_detection_center_hint_tolerance_px)
+    )
+    half_span = int(
+        math.ceil(
+            expected_radius
+            + center_tolerance
+            + max(0.0, config.circle_detection_crop_padding_px)
+        )
+    )
+    left = max(0, int(math.floor(center_x - half_span)))
+    top = max(0, int(math.floor(center_y - half_span)))
+    right = min(width, int(math.ceil(center_x + half_span + 1.0)))
+    bottom = min(height, int(math.ceil(center_y + half_span + 1.0)))
+    return left, top, right, bottom
+
+
+def _build_prototype_mask(
+    roi: np.ndarray,
+    prototype_bgr: tuple[float, float, float],
+    distance_threshold: float,
+) -> np.ndarray:
+    prototype = np.array(prototype_bgr, dtype=np.float32)
+    diff = roi.astype(np.float32) - prototype
+    distance = np.sqrt(np.sum(diff * diff, axis=2))
+    return np.where(distance <= distance_threshold, 255, 0).astype(np.uint8)
+
+
+def _build_compass_ring_masks(roi: np.ndarray, hsv: np.ndarray, config: AlignConfig) -> tuple[np.ndarray, np.ndarray]:
+    strong_hsv_mask = cv2.inRange(
+        hsv,
+        np.array([config.ring_blue_h_min, config.ring_blue_s_min, config.ring_blue_v_min], dtype=np.uint8),
+        np.array([config.ring_blue_h_max, 255, 255], dtype=np.uint8),
+    )
+    weak_hsv_mask = cv2.inRange(
+        hsv,
+        np.array([config.outer_ring_blue_h_min, config.outer_ring_blue_s_min, config.outer_ring_blue_v_min], dtype=np.uint8),
+        np.array([config.outer_ring_blue_h_max, 255, 255], dtype=np.uint8),
+    )
+    strong_proto_mask = _build_prototype_mask(
+        roi,
+        config.inner_ring_bgr_prototype,
+        config.inner_ring_bgr_distance_threshold,
+    )
+    weak_proto_mask = _build_prototype_mask(
+        roi,
+        config.outer_ring_bgr_prototype,
+        config.outer_ring_bgr_distance_threshold,
+    )
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    strong_ring_mask = np.where(
+        np.logical_or(strong_hsv_mask > 0, strong_proto_mask > 0),
+        255,
+        0,
+    ).astype(np.uint8)
+    weak_ring_mask = np.where(
+        np.logical_or.reduce((weak_hsv_mask > 0, weak_proto_mask > 0, strong_ring_mask > 0)),
+        255,
+        0,
+    ).astype(np.uint8)
+    strong_ring_mask = cv2.morphologyEx(strong_ring_mask, cv2.MORPH_OPEN, kernel)
+    strong_ring_mask = cv2.morphologyEx(strong_ring_mask, cv2.MORPH_CLOSE, kernel)
+    weak_ring_mask = cv2.morphologyEx(weak_ring_mask, cv2.MORPH_OPEN, kernel)
+    weak_ring_mask = cv2.morphologyEx(weak_ring_mask, cv2.MORPH_CLOSE, kernel)
+    if config.inner_ring_tracking_only:
+        # When tracking only the brighter inner ring, the dim outer ring is more likely
+        # to be corrupted by shadows and background detail than to add useful evidence.
+        weak_ring_mask = strong_ring_mask.copy()
+    return strong_ring_mask, weak_ring_mask
+
+
+@lru_cache(maxsize=16)
+def _inner_ring_template(
+    *,
+    radius: int,
+    half_width: int,
+    padding: int,
+) -> tuple[np.ndarray, int, int]:
+    center = radius + half_width + padding
+    size = (center * 2) + 1
+    yy, xx = np.ogrid[:size, :size]
+    distances = np.sqrt(((xx - center) ** 2) + ((yy - center) ** 2))
+    template = np.where(
+        np.logical_and(distances >= (radius - half_width), distances <= (radius + half_width)),
+        255,
+        0,
+    ).astype(np.uint8)
+    return template, center, center
+
+
+@lru_cache(maxsize=16)
+def _inner_ring_search_offsets(
+    *,
+    radius: int,
+    half_width: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    span = radius + half_width + 2
+    yy, xx = np.mgrid[-span : span + 1, -span : span + 1]
+    distances = np.sqrt((xx.astype(np.float32) ** 2) + (yy.astype(np.float32) ** 2))
+    ring_mask = np.logical_and(distances >= (radius - half_width), distances <= (radius + half_width))
+    center_mask = distances <= max(1.0, radius - 3.0)
+    ring_y, ring_x = np.nonzero(ring_mask)
+    center_y, center_x = np.nonzero(center_mask)
+    origin = span
+    return (
+        ring_y.astype(np.int16) - origin,
+        ring_x.astype(np.int16) - origin,
+        center_y.astype(np.int16) - origin,
+        center_x.astype(np.int16) - origin,
+    )
+
+
+def _find_inner_ring_center_by_offset_search(
+    mask: np.ndarray,
+    *,
+    expected_center_x: float,
+    expected_center_y: float,
+    config: AlignConfig,
+    max_center_error_px: float | None = None,
+) -> tuple[float, float, float] | None:
+    if mask.size == 0 or np.count_nonzero(mask) == 0:
+        return None
+
+    base_search_radius = max(1, int(config.inner_ring_center_search_radius_px))
+    search_radius = (
+        min(base_search_radius, max(1, int(math.ceil(max_center_error_px))))
+        if max_center_error_px is not None
+        else base_search_radius
+    )
+    half_width = max(1, int(round(config.ring_score_inner_width_px)))
+    ring_y_offsets, ring_x_offsets, center_y_offsets, center_x_offsets = _inner_ring_search_offsets(
+        radius=max(2, int(round(config.inner_ring_radius_px))),
+        half_width=half_width,
+    )
+
+    best: tuple[float, float, float] | None = None
+    best_score = float("-inf")
+    expected_x = int(round(expected_center_x))
+    expected_y = int(round(expected_center_y))
+    height, width = mask.shape[:2]
+
+    for center_y in range(max(0, expected_y - search_radius), min(height, expected_y + search_radius + 1)):
+        for center_x in range(max(0, expected_x - search_radius), min(width, expected_x + search_radius + 1)):
+            ring_y = center_y + ring_y_offsets
+            ring_x = center_x + ring_x_offsets
+            ring_valid = np.logical_and.reduce((ring_y >= 0, ring_y < height, ring_x >= 0, ring_x < width))
+            if not np.any(ring_valid):
+                continue
+            ring_coverage = float(ring_valid.mean())
+            if ring_coverage < 0.85:
+                continue
+            inner_score = float((mask[ring_y[ring_valid], ring_x[ring_valid]] > 0).mean())
+
+            center_y_samples = center_y + center_y_offsets
+            center_x_samples = center_x + center_x_offsets
+            center_valid = np.logical_and.reduce(
+                (center_y_samples >= 0, center_y_samples < height, center_x_samples >= 0, center_x_samples < width)
+            )
+            center_leak = (
+                float((mask[center_y_samples[center_valid], center_x_samples[center_valid]] > 0).mean())
+                if np.any(center_valid)
+                else 0.0
+            )
+            center_error = math.hypot(center_x - expected_center_x, center_y - expected_center_y)
+            score = (inner_score * 9.0) - (center_leak * 2.0) - (center_error * 0.18)
+            if score > best_score:
+                best_score = score
+                best = (float(center_x), float(center_y), score)
+
+    if best is None or best[2] < config.inner_ring_center_search_min_score:
+        return None
+    return best
+
+
+def _find_inner_ring_template_candidate(
+    mask: np.ndarray,
+    *,
+    search_left: int,
+    search_top: int,
+    expected_radius: float,
+    config: AlignConfig,
+) -> tuple[float, float, float, float] | None:
+    if mask.size == 0 or np.count_nonzero(mask) == 0:
+        return None
+
+    expected_inner_radius = max(4, int(round(expected_radius - config.inner_ring_outer_radius_offset_px)))
+    best: tuple[float, float, float, float] | None = None
+    best_score = float("-inf")
+    half_width = max(1, int(round(config.ring_score_inner_width_px)))
+    padding = max(2, int(config.inner_ring_template_padding_px))
+    tolerance = max(0, int(config.inner_ring_template_radius_tolerance_px))
+
+    for inner_radius in range(expected_inner_radius - tolerance, expected_inner_radius + tolerance + 1):
+        if inner_radius < 4:
+            continue
+        template, offset_x, offset_y = _inner_ring_template(
+            radius=inner_radius,
+            half_width=half_width,
+            padding=padding,
+        )
+        if mask.shape[0] < template.shape[0] or mask.shape[1] < template.shape[1]:
+            continue
+        result = cv2.matchTemplate(mask, template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, max_loc = cv2.minMaxLoc(result)
+        if score > best_score:
+            best_score = float(score)
+            best = (
+                float(max_loc[0] + offset_x + search_left),
+                float(max_loc[1] + offset_y + search_top),
+                float(inner_radius + config.inner_ring_outer_radius_offset_px),
+                float(score),
+            )
+
+    return best
+
+
+def _detect_compass_circle(
+    roi: np.ndarray,
+    hsv: np.ndarray,
+    config: AlignConfig,
+    *,
+    center_hint_x: float | None = None,
+    center_hint_y: float | None = None,
+) -> dict[str, float] | None:
+    roi_center_x = roi.shape[1] / 2.0
+    roi_center_y = roi.shape[0] / 2.0
+    expected_radius = max(config.compass_radius_px, 1.0)
+    if not config.dynamic_center_enabled:
+        return {"center_x": roi_center_x, "center_y": roi_center_y, "radius": expected_radius, "score": 0.0}
+
+    strong_ring_mask, weak_ring_mask = _build_compass_ring_masks(roi, hsv, config)
+    strong_ring_search_mask = strong_ring_mask
+    weak_ring_search_mask = weak_ring_mask
+
+    best_circle: dict[str, float] | None = None
+    best_score = float("-inf")
+    candidates: list[dict[str, float]] = [
+        {
+            "center_x": roi_center_x,
+            "center_y": roi_center_y,
+            "radius": expected_radius,
+            "axis_x": expected_radius,
+            "axis_y": expected_radius,
+            "angle_degrees": 0.0,
+            "source_bonus": 0.0,
+        },
+    ]
+    if center_hint_x is not None and center_hint_y is not None:
+        candidates.append(
+            {
+                "center_x": float(center_hint_x),
+                "center_y": float(center_hint_y),
+                "radius": expected_radius,
+                "axis_x": expected_radius,
+                "axis_y": expected_radius,
+                "angle_degrees": 0.0,
+                "source_bonus": 0.0,
+            }
+        )
+
+    template_candidate = _find_inner_ring_template_candidate(
+        strong_ring_search_mask,
+        search_left=0,
+        search_top=0,
+        expected_radius=expected_radius,
+        config=config,
+    )
+    if template_candidate is not None:
+        template_center_x, template_center_y, template_radius, template_score = template_candidate
+        candidates.append(
+            {
+                "center_x": template_center_x,
+                "center_y": template_center_y,
+                "radius": template_radius,
+                "axis_x": template_radius,
+                "axis_y": template_radius,
+                "angle_degrees": 0.0,
+                "source_bonus": float(template_score * 4.0),
+            }
+        )
+
+    def add_hough_candidates(
+        mask: np.ndarray,
+        expected_candidate_radius: float,
+        radius_adjustment: float = 0.0,
+        *,
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> None:
+        if mask.size == 0:
+            return
+        blurred = cv2.GaussianBlur(mask, (5, 5), 0)
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=max(config.circle_detection_dp, 1.0),
+            minDist=max(expected_candidate_radius * 0.75, 12.0),
+            param1=max(config.circle_detection_param1, 1.0),
+            param2=max(config.circle_detection_param2, 1.0),
+            minRadius=max(4, int(round(expected_candidate_radius - config.circle_detection_radius_tolerance_px))),
+            maxRadius=max(6, int(round(expected_candidate_radius + config.circle_detection_radius_tolerance_px))),
+        )
+        if circles is None:
+            return
+        for circle in circles[0]:
+            candidates.append(
+                {
+                    "center_x": float(circle[0] + offset_x),
+                    "center_y": float(circle[1] + offset_y),
+                    "radius": float(expected_radius if config.inner_ring_tracking_only else circle[2] + radius_adjustment),
+                    "axis_x": float(expected_radius if config.inner_ring_tracking_only else circle[2] + radius_adjustment),
+                    "axis_y": float(expected_radius if config.inner_ring_tracking_only else circle[2] + radius_adjustment),
+                    "angle_degrees": 0.0,
+                    "source_bonus": 0.4,
+                }
+            )
+
+    if not config.inner_ring_tracking_only:
+        add_hough_candidates(
+            weak_ring_search_mask,
+            expected_radius,
+            0.0,
+        )
+    add_hough_candidates(
+        strong_ring_search_mask,
+        max(4.0, expected_radius - config.inner_ring_outer_radius_offset_px),
+        0.0 if config.inner_ring_tracking_only else config.inner_ring_outer_radius_offset_px,
+    )
+
+    if not config.inner_ring_tracking_only:
+        contours, _ = cv2.findContours(weak_ring_search_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < config.ring_min_area:
+                continue
+            (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+            candidates.append(
+                {
+                    "center_x": float(center_x),
+                    "center_y": float(center_y),
+                    "radius": float(radius),
+                    "axis_x": float(radius),
+                    "axis_y": float(radius),
+                    "angle_degrees": 0.0,
+                    "source_bonus": min(0.35, float(area * 0.00005)),
+                }
+            )
+
+    strong_contours, _ = cv2.findContours(strong_ring_search_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in strong_contours:
+        area = cv2.contourArea(contour)
+        if area < max(12.0, config.ring_min_area * 0.25):
+            continue
+        if len(contour) >= 5:
+            ellipse = cv2.fitEllipse(contour)
+            center_x = float(ellipse[0][0])
+            center_y = float(ellipse[0][1])
+            axis_x = max(1.0, float(ellipse[1][0]) / 2.0)
+            axis_y = max(1.0, float(ellipse[1][1]) / 2.0)
+            major_axis = max(axis_x, axis_y)
+            minor_axis = min(axis_x, axis_y)
+            if minor_axis / max(major_axis, 1.0) < config.circle_detection_min_axis_ratio:
+                continue
+            radius = float(expected_radius if config.inner_ring_tracking_only else (axis_x + axis_y) / 2.0)
+            angle_degrees = float(ellipse[2])
+        else:
+            (raw_center_x, raw_center_y), inner_radius = cv2.minEnclosingCircle(contour)
+            center_x = float(raw_center_x)
+            center_y = float(raw_center_y)
+            radius = float(
+                expected_radius
+                if config.inner_ring_tracking_only
+                else inner_radius + config.inner_ring_outer_radius_offset_px
+            )
+            axis_x = radius
+            axis_y = radius
+            angle_degrees = 0.0
+        candidates.append(
+            {
+                "center_x": center_x,
+                "center_y": center_y,
+                "radius": radius,
+                "axis_x": axis_x,
+                "axis_y": axis_y,
+                "angle_degrees": angle_degrees,
+                "source_bonus": min(0.5, float(area * 0.00008)),
+            }
+        )
+
+    for candidate in _dedupe_circle_candidates(candidates):
+        center_x = candidate["center_x"]
+        center_y = candidate["center_y"]
+        radius = candidate["radius"]
+        score = _score_compass_circle_candidate(
+            strong_ring_mask=strong_ring_mask,
+            weak_ring_mask=weak_ring_mask,
+            center_x=center_x,
+            center_y=center_y,
+            radius=radius,
+            axis_x=candidate.get("axis_x"),
+            axis_y=candidate.get("axis_y"),
+            angle_degrees=candidate.get("angle_degrees", 0.0),
+            expected_center_x=roi_center_x,
+            expected_center_y=roi_center_y,
+            expected_radius=expected_radius,
+            max_center_error_px=None,
+            config=config,
+        )
+        score += candidate.get("source_bonus", 0.0)
+        if score > best_score:
+            best_score = score
+            best_circle = {
+                "center_x": center_x,
+                "center_y": center_y,
+                "radius": radius,
+                "score": score,
+            }
+
+    if best_circle is not None and best_score > 0.0:
+        return best_circle
+
+    return None
+
+
+def _dedupe_circle_candidates(candidates: list[dict[str, float]]) -> list[dict[str, float]]:
+    seen: set[tuple[int, int, int]] = set()
+    deduped: list[dict[str, float]] = []
+    for candidate in candidates:
+        key = (
+            int(round(candidate["center_x"] / 3.0)),
+            int(round(candidate["center_y"] / 3.0)),
+            int(round(candidate["radius"] / 3.0)),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _score_compass_circle_candidate(
+    *,
+    strong_ring_mask: np.ndarray,
+    weak_ring_mask: np.ndarray,
+    center_x: float,
+    center_y: float,
+    radius: float,
+    axis_x: float | None,
+    axis_y: float | None,
+    angle_degrees: float,
+    expected_center_x: float,
+    expected_center_y: float,
+    expected_radius: float,
+    max_center_error_px: float | None,
+    config: AlignConfig,
+) -> float:
+    radius_error = abs(radius - expected_radius)
+    if radius_error > config.circle_detection_radius_tolerance_px:
+        return float("-inf")
+
+    center_error = math.hypot(center_x - expected_center_x, center_y - expected_center_y)
+    if max_center_error_px is not None and center_error > max_center_error_px:
+        return float("-inf")
+
+    patch_left, patch_top, patch_right, patch_bottom = _circle_candidate_patch_bounds(
+        width=strong_ring_mask.shape[1],
+        height=strong_ring_mask.shape[0],
+        center_x=center_x,
+        center_y=center_y,
+        radius=max(radius, expected_radius),
+        axis_x=axis_x,
+        axis_y=axis_y,
+        config=config,
+    )
+    strong_patch = strong_ring_mask[patch_top:patch_bottom, patch_left:patch_right]
+    weak_patch = weak_ring_mask[patch_top:patch_bottom, patch_left:patch_right]
+    local_center_x = center_x - patch_left
+    local_center_y = center_y - patch_top
+    yy, xx = np.ogrid[: strong_patch.shape[0], : strong_patch.shape[1]]
+    dx = xx - local_center_x
+    dy = yy - local_center_y
+    distances = np.sqrt((dx**2) + (dy**2))
+    angles = (np.arctan2(dy, dx) + (2.0 * np.pi)) % (2.0 * np.pi)
+    effective_axis_x = max(1.0, float(axis_x if axis_x is not None else radius))
+    effective_axis_y = max(1.0, float(axis_y if axis_y is not None else radius))
+    ellipse_distortion = abs(effective_axis_x - effective_axis_y)
+    inner_width = config.ring_score_inner_width_px + min(4.0, ellipse_distortion * 0.35)
+    outer_width = config.ring_score_outer_width_px + min(4.0, ellipse_distortion * 0.35)
+
+    inner_radius = (
+        max(1.0, config.inner_ring_radius_px)
+        if config.inner_ring_tracking_only
+        else max(1.0, radius - config.inner_ring_outer_radius_offset_px)
+    )
+    inner_radius_for_fill = max(1.0, inner_radius - 3.0 - (ellipse_distortion * 0.2))
+    inner_annulus = np.logical_and(
+        distances >= (inner_radius - inner_width),
+        distances <= (inner_radius + inner_width),
+    )
+    center_disk = distances <= inner_radius_for_fill
+
+    inner_score = float((strong_patch[inner_annulus] > 0).mean()) if np.any(inner_annulus) else 0.0
+    center_leak = float((weak_patch[center_disk] > 0).mean()) if np.any(center_disk) else 0.0
+
+    angular_bins = max(4, config.ring_score_angular_bins)
+    angular_hits = 0
+    ring_bin_hits: list[bool] = []
+    if np.any(inner_annulus):
+        inner_pixels = strong_patch[inner_annulus] > 0
+        inner_angles = angles[inner_annulus]
+        for bin_index in range(angular_bins):
+            start_angle = (2.0 * np.pi * bin_index) / angular_bins
+            end_angle = (2.0 * np.pi * (bin_index + 1)) / angular_bins
+            bin_mask = np.logical_and(inner_angles >= start_angle, inner_angles < end_angle)
+            hit = np.any(bin_mask) and float(inner_pixels[bin_mask].mean()) >= 0.08
+            ring_bin_hits.append(hit)
+            if hit:
+                angular_hits += 1
+    angular_coverage = angular_hits / angular_bins
+    if config.inner_ring_tracking_only:
+        if inner_score < 0.18 or angular_coverage < 0.35:
+            return float("-inf")
+        return (
+            (inner_score * 9.0)
+            + (angular_coverage * 3.0)
+            - (radius_error * 0.05)
+            - (center_error * 0.08)
+            - (center_leak * 2.0)
+        )
+
+    outer_annulus = np.logical_and(
+        distances >= (radius - outer_width),
+        distances <= (radius + outer_width),
+    )
+    outer_score = float((weak_patch[outer_annulus] > 0).mean()) if np.any(outer_annulus) else 0.0
+    outer_bin_hits: list[bool] = []
+    if np.any(outer_annulus):
+        outer_pixels = weak_patch[outer_annulus] > 0
+        outer_angles = angles[outer_annulus]
+        for bin_index in range(angular_bins):
+            start_angle = (2.0 * np.pi * bin_index) / angular_bins
+            end_angle = (2.0 * np.pi * (bin_index + 1)) / angular_bins
+            bin_mask = np.logical_and(outer_angles >= start_angle, outer_angles < end_angle)
+            hit = np.any(bin_mask) and float(outer_pixels[bin_mask].mean()) >= 0.08
+            outer_bin_hits.append(hit)
+    segment_groups = _circular_true_group_count(outer_bin_hits)
+    segment_score = max(0.0, 1.0 - (abs(segment_groups - 4) / 4.0))
+
+    if inner_score < 0.10:
+        return float("-inf")
+    if outer_score < 0.03 and angular_coverage < 0.20:
+        return float("-inf")
+
+    return (
+        (inner_score * 7.0)
+        + (outer_score * 2.0)
+        + (angular_coverage * 1.5)
+        + (segment_score * 1.5)
+        - (radius_error * 0.35)
+        - (center_error * 0.10)
+        - (center_leak * 1.5)
+    )
+
+
+def _circle_candidate_patch_bounds(
+    *,
+    width: int,
+    height: int,
+    center_x: float,
+    center_y: float,
+    radius: float,
+    axis_x: float | None,
+    axis_y: float | None,
+    config: AlignConfig,
+) -> tuple[int, int, int, int]:
+    span = max(radius, axis_x or radius, axis_y or radius) + config.ring_score_candidate_padding_px
+    left = max(0, int(math.floor(center_x - span)))
+    top = max(0, int(math.floor(center_y - span)))
+    right = min(width, int(math.ceil(center_x + span + 1.0)))
+    bottom = min(height, int(math.ceil(center_y + span + 1.0)))
+    return left, top, right, bottom
+
+
+def _circular_true_group_count(values: list[bool]) -> int:
+    if not values or not any(values):
+        return 0
+    groups = 0
+    previous = values[-1]
+    for current in values:
+        if current and not previous:
+            groups += 1
+        previous = current
+    return groups
+
+
+def _candidate_components(
+    mask: np.ndarray,
+    hsv: np.ndarray,
+    config: AlignConfig,
+    *,
+    local_center_x: float | None = None,
+    local_center_y: float | None = None,
+) -> list[dict[str, float]]:
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    if local_center_x is None:
+        local_center_x = config.roi_size / 2.0
+    if local_center_y is None:
+        local_center_y = config.roi_size / 2.0
+    candidates: list[dict[str, float]] = []
+
+    for index in range(1, num_labels):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < config.marker_min_area or area > config.marker_max_area:
+            continue
+
+        centroid_x = float(centroids[index][0])
+        centroid_y = float(centroids[index][1])
+        if math.hypot(centroid_x - local_center_x, centroid_y - local_center_y) > config.max_marker_distance_px:
+            continue
+
+        component_mask = labels == index
+        mean_value = float(hsv[:, :, 2][component_mask].mean())
+        candidates.append(
+            {
+                "area": float(area),
+                "centroid_x": centroid_x,
+                "centroid_y": centroid_y,
+                "mean_value": mean_value,
+            }
+        )
+
+    candidates.sort(key=lambda candidate: (candidate["area"], candidate["mean_value"]), reverse=True)
+    return candidates
+
+
+def _occupancy_scores(
+    mask: np.ndarray,
+    centroid_x: float,
+    centroid_y: float,
+    config: AlignConfig,
+) -> tuple[float, float]:
+    yy, xx = np.ogrid[: mask.shape[0], : mask.shape[1]]
+    squared_distance = (xx - centroid_x) ** 2 + (yy - centroid_y) ** 2
+
+    inner_mask = squared_distance <= config.inner_disk_radius_px**2
+    outer_mask = squared_distance <= config.outer_disk_radius_px**2
+    outer_ring_mask = np.logical_and(outer_mask, np.logical_not(inner_mask))
+
+    inner_pixels = mask[inner_mask] > 0
+    outer_ring_pixels = mask[outer_ring_mask] > 0
+
+    inner_occupancy = float(inner_pixels.mean()) if inner_pixels.size else 0.0
+    outer_ring_occupancy = float(outer_ring_pixels.mean()) if outer_ring_pixels.size else 0.0
+    return inner_occupancy, outer_ring_occupancy
+
+
+def _refine_hollow_center(
+    mask: np.ndarray,
+    centroid_x: float,
+    centroid_y: float,
+    config: AlignConfig,
+) -> dict[str, float] | None:
+    best_candidate: dict[str, float] | None = None
+    search_radius = max(config.refinement_search_radius_px, config.outer_disk_radius_px)
+    for offset_x in range(-search_radius, search_radius + 1):
+        for offset_y in range(-search_radius, search_radius + 1):
+            candidate_x = centroid_x + offset_x
+            candidate_y = centroid_y + offset_y
+            inner_occupancy, outer_ring_occupancy = _occupancy_scores(mask, candidate_x, candidate_y, config)
+            if inner_occupancy >= config.filled_inner_occupancy_threshold or outer_ring_occupancy <= 0.0:
+                continue
+
+            displacement = math.hypot(offset_x, offset_y)
+            score = outer_ring_occupancy - inner_occupancy - (displacement * 0.06)
+            candidate = {
+                "score": score,
+                "x": candidate_x,
+                "y": candidate_y,
+                "inner_occupancy": inner_occupancy,
+                "outer_ring_occupancy": outer_ring_occupancy,
+            }
+            if best_candidate is None or candidate["score"] > best_candidate["score"]:
+                best_candidate = candidate
+
+    return best_candidate
+
+
+def _extract_roi(image: Any, region: Region) -> np.ndarray:
+    x, y, width, height = region
+    if image.shape[1] < x + width or image.shape[0] < y + height:
+        raise ValueError("Image does not match the calibrated ROI bounds for compass detection.")
+    return image[y : y + height, x : x + width]
+
+
+def _rotate_offset(dx: float, dy: float, rotation_radians: float) -> tuple[float, float]:
+    cosine = math.cos(rotation_radians)
+    sine = math.sin(rotation_radians)
+    return (cosine * dx) - (sine * dy), (sine * dx) + (cosine * dy)
