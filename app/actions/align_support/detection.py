@@ -642,8 +642,18 @@ def _detect_compass_circle(
         return {"center_x": roi_center_x, "center_y": roi_center_y, "radius": expected_radius, "score": 0.0}
 
     strong_ring_mask, weak_ring_mask = _build_compass_ring_masks(roi, hsv, config)
-    strong_ring_search_mask = strong_ring_mask
-    weak_ring_search_mask = weak_ring_mask
+    max_center_error_px = config.circle_detection_max_center_error_px if config.circle_detection_max_center_error_px > 0.0 else None
+    search_left, search_top, search_right, search_bottom = _circle_search_bounds(
+        width=roi.shape[1],
+        height=roi.shape[0],
+        center_x=roi_center_x,
+        center_y=roi_center_y,
+        expected_radius=expected_radius,
+        config=config,
+        max_center_error_px=max_center_error_px,
+    )
+    strong_ring_search_mask = strong_ring_mask[search_top:search_bottom, search_left:search_right]
+    weak_ring_search_mask = weak_ring_mask[search_top:search_bottom, search_left:search_right]
 
     best_circle: dict[str, float] | None = None
     best_score = float("-inf")
@@ -673,8 +683,8 @@ def _detect_compass_circle(
 
     template_candidate = _find_inner_ring_template_candidate(
         strong_ring_search_mask,
-        search_left=0,
-        search_top=0,
+        search_left=search_left,
+        search_top=search_top,
         expected_radius=expected_radius,
         config=config,
     )
@@ -733,11 +743,15 @@ def _detect_compass_circle(
             weak_ring_search_mask,
             expected_radius,
             0.0,
+            offset_x=search_left,
+            offset_y=search_top,
         )
     add_hough_candidates(
         strong_ring_search_mask,
         max(4.0, expected_radius - config.inner_ring_outer_radius_offset_px),
         0.0 if config.inner_ring_tracking_only else config.inner_ring_outer_radius_offset_px,
+        offset_x=search_left,
+        offset_y=search_top,
     )
 
     if not config.inner_ring_tracking_only:
@@ -749,8 +763,8 @@ def _detect_compass_circle(
             (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
             candidates.append(
                 {
-                    "center_x": float(center_x),
-                    "center_y": float(center_y),
+                    "center_x": float(center_x + search_left),
+                    "center_y": float(center_y + search_top),
                     "radius": float(radius),
                     "axis_x": float(radius),
                     "axis_y": float(radius),
@@ -766,8 +780,8 @@ def _detect_compass_circle(
             continue
         if len(contour) >= 5:
             ellipse = cv2.fitEllipse(contour)
-            center_x = float(ellipse[0][0])
-            center_y = float(ellipse[0][1])
+            center_x = float(ellipse[0][0] + search_left)
+            center_y = float(ellipse[0][1] + search_top)
             axis_x = max(1.0, float(ellipse[1][0]) / 2.0)
             axis_y = max(1.0, float(ellipse[1][1]) / 2.0)
             major_axis = max(axis_x, axis_y)
@@ -778,8 +792,8 @@ def _detect_compass_circle(
             angle_degrees = float(ellipse[2])
         else:
             (raw_center_x, raw_center_y), inner_radius = cv2.minEnclosingCircle(contour)
-            center_x = float(raw_center_x)
-            center_y = float(raw_center_y)
+            center_x = float(raw_center_x + search_left)
+            center_y = float(raw_center_y + search_top)
             radius = float(
                 expected_radius
                 if config.inner_ring_tracking_only
@@ -800,26 +814,33 @@ def _detect_compass_circle(
             }
         )
 
-    for candidate in _dedupe_circle_candidates(candidates):
-        center_x = candidate["center_x"]
-        center_y = candidate["center_y"]
-        radius = candidate["radius"]
+    deduped_candidates = _dedupe_circle_candidates(candidates)
+    scored_candidates: list[tuple[float, dict[str, float]]] = []
+
+    def score_candidate(candidate: dict[str, float]) -> float:
         score = _score_compass_circle_candidate(
             strong_ring_mask=strong_ring_mask,
             weak_ring_mask=weak_ring_mask,
-            center_x=center_x,
-            center_y=center_y,
-            radius=radius,
+            center_x=candidate["center_x"],
+            center_y=candidate["center_y"],
+            radius=candidate["radius"],
             axis_x=candidate.get("axis_x"),
             axis_y=candidate.get("axis_y"),
             angle_degrees=candidate.get("angle_degrees", 0.0),
             expected_center_x=roi_center_x,
             expected_center_y=roi_center_y,
             expected_radius=expected_radius,
-            max_center_error_px=config.circle_detection_max_center_error_px if config.circle_detection_max_center_error_px > 0.0 else None,
+            max_center_error_px=max_center_error_px,
             config=config,
         )
-        score += candidate.get("source_bonus", 0.0)
+        return score + candidate.get("source_bonus", 0.0)
+
+    for candidate in deduped_candidates:
+        center_x = candidate["center_x"]
+        center_y = candidate["center_y"]
+        radius = candidate["radius"]
+        score = score_candidate(candidate)
+        scored_candidates.append((score, candidate))
         if score > best_score:
             best_score = score
             best_circle = {
@@ -828,6 +849,47 @@ def _detect_compass_circle(
                 "radius": radius,
                 "score": score,
             }
+
+    refinement_candidate: dict[str, float] | None = None
+    for score, candidate in sorted(scored_candidates, key=lambda item: item[0], reverse=True):
+        if not math.isfinite(score):
+            continue
+        center_error = math.hypot(candidate["center_x"] - roi_center_x, candidate["center_y"] - roi_center_y)
+        if center_error < 6.0:
+            continue
+        if score < (best_score - 0.75):
+            continue
+        refinement_candidate = candidate
+        break
+
+    if refinement_candidate is not None:
+        candidate = refinement_candidate
+        refined_center = _find_inner_ring_center_by_offset_search(
+            strong_ring_search_mask,
+            expected_center_x=candidate["center_x"],
+            expected_center_y=candidate["center_y"],
+            config=config,
+            max_center_error_px=max_center_error_px,
+        )
+        if refined_center is not None:
+            refined_center_x, refined_center_y, _ = refined_center
+            refined_candidate = {
+                **candidate,
+                "center_x": refined_center_x,
+                "center_y": refined_center_y,
+                "axis_x": candidate["radius"],
+                "axis_y": candidate["radius"],
+                "angle_degrees": 0.0,
+            }
+            score = score_candidate(refined_candidate)
+            if score > best_score:
+                best_score = score
+                best_circle = {
+                    "center_x": refined_candidate["center_x"],
+                    "center_y": refined_candidate["center_y"],
+                    "radius": refined_candidate["radius"],
+                    "score": score,
+                }
 
     if best_circle is not None and best_score > 0.0:
         return best_circle
