@@ -11,6 +11,47 @@ from app.actions.align_support.models import AlignConfig, CompassMarker, Compass
 from app.domain.protocols import Region
 
 
+def _has_warm_content_inside_circle(
+    primary_mask: np.ndarray,
+    fallback_mask: np.ndarray,
+    *,
+    center_x: float,
+    center_y: float,
+    search_radius_px: float,
+) -> bool:
+    """Return True if any warm-colored pixel exists within search_radius_px of the given center.
+
+    The compass ring is the only blue ring in the cockpit that consistently
+    contains a warm (orange/amber) marker inside it. Panel borders and the
+    console dome ring have no such content at their center positions.
+    """
+    height, width = primary_mask.shape[:2]
+    cx = int(round(center_x))
+    cy = int(round(center_y))
+    r = int(math.ceil(search_radius_px))
+    x0 = max(0, cx - r)
+    y0 = max(0, cy - r)
+    x1 = min(width, cx + r + 1)
+    y1 = min(height, cy + r + 1)
+    if x0 >= x1 or y0 >= y1:
+        return False
+    patch_primary = primary_mask[y0:y1, x0:x1]
+    if np.any(patch_primary > 0):
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dist_sq = (xx - center_x) ** 2 + (yy - center_y) ** 2
+        within = dist_sq <= search_radius_px ** 2
+        if np.any(np.logical_and(within, patch_primary > 0)):
+            return True
+    patch_fallback = fallback_mask[y0:y1, x0:x1]
+    if np.any(patch_fallback > 0):
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dist_sq = (xx - center_x) ** 2 + (yy - center_y) ** 2
+        within = dist_sq <= search_radius_px ** 2
+        if np.any(np.logical_and(within, patch_fallback > 0)):
+            return True
+    return False
+
+
 def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
     if image is None:
         return CompassReadResult(status="missing")
@@ -38,6 +79,19 @@ def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
     compass_center_local_x = circle["center_x"]
     compass_center_local_y = circle["center_y"]
     compass_radius_estimate = circle["radius"]
+
+    # Validate: the compass ring is the only blue ring in the cockpit that
+    # contains warm (orange) marker content inside it. Reject circles that
+    # have no warm pixels within compass_radius_px + small margin of their
+    # center — those are console-ring arcs or panel borders, not the compass.
+    if not _has_warm_content_inside_circle(
+        mask_closed,
+        fallback_mask,
+        center_x=compass_center_local_x,
+        center_y=compass_center_local_y,
+        search_radius_px=config.max_marker_distance_px,
+    ):
+        return CompassReadResult(status="circle_only")
 
     # Phase 3: detect the marker relative to the finalized circle center.
     marker_detection = _detect_compass_marker_relative_to_circle(
