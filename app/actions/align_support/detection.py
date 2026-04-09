@@ -73,6 +73,20 @@ def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
         center_hint_x=None if center_dot_hint is None else center_dot_hint[0],
         center_hint_y=None if center_dot_hint is None else center_dot_hint[1],
     )
+    recovered_marker_detection: dict[str, float | str] | None = None
+    if circle is None and center_dot_hint is not None:
+        recovery = _recover_compass_circle_from_center_hint(
+            roi=roi,
+            hsv=hsv,
+            primary_mask=mask_closed,
+            fallback_mask=fallback_mask,
+            config=config,
+            center_hint_x=center_dot_hint[0],
+            center_hint_y=center_dot_hint[1],
+        )
+        if recovery is not None:
+            circle = recovery["circle"]
+            recovered_marker_detection = recovery["marker_detection"]
     if circle is None:
         return CompassReadResult(status="missing")
 
@@ -94,13 +108,17 @@ def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
         return CompassReadResult(status="circle_only")
 
     # Phase 3: detect the marker relative to the finalized circle center.
-    marker_detection = _detect_compass_marker_relative_to_circle(
-        primary_mask=mask_closed,
-        fallback_mask=fallback_mask,
-        hsv=hsv,
-        config=config,
-        local_center_x=compass_center_local_x,
-        local_center_y=compass_center_local_y,
+    marker_detection = (
+        recovered_marker_detection
+        if recovered_marker_detection is not None
+        else _detect_compass_marker_relative_to_circle(
+            primary_mask=mask_closed,
+            fallback_mask=fallback_mask,
+            hsv=hsv,
+            config=config,
+            local_center_x=compass_center_local_x,
+            local_center_y=compass_center_local_y,
+        )
     )
     if marker_detection["status"] == "circle_only":
         return CompassReadResult(status="circle_only")
@@ -153,6 +171,66 @@ def detect_compass_marker(image: Any, config: AlignConfig) -> CompassReadResult:
         compass_radius_estimate_px=compass_radius_estimate,
     )
     return CompassReadResult(status=state, marker=marker)
+
+
+def _recover_compass_circle_from_center_hint(
+    *,
+    roi: np.ndarray,
+    hsv: np.ndarray,
+    primary_mask: np.ndarray,
+    fallback_mask: np.ndarray,
+    config: AlignConfig,
+    center_hint_x: float,
+    center_hint_y: float,
+) -> dict[str, Any] | None:
+    strong_ring_mask, _ = _build_compass_ring_masks(roi, hsv, config)
+    refined_center = _find_inner_ring_center_by_offset_search(
+        strong_ring_mask,
+        expected_center_x=center_hint_x,
+        expected_center_y=center_hint_y,
+        config=config,
+        max_center_error_px=max(config.inner_ring_center_search_radius_px, config.center_dot_search_radius_px),
+    )
+    if refined_center is None:
+        return None
+
+    refined_center_x, refined_center_y, refined_score = refined_center
+    if math.hypot(refined_center_x - center_hint_x, refined_center_y - center_hint_y) > max(
+        12.0,
+        config.center_dot_search_radius_px,
+        config.compass_radius_px * 0.70,
+    ):
+        return None
+
+    if not _has_warm_content_inside_circle(
+        primary_mask,
+        fallback_mask,
+        center_x=refined_center_x,
+        center_y=refined_center_y,
+        search_radius_px=config.max_marker_distance_px,
+    ):
+        return None
+
+    marker_detection = _detect_compass_marker_relative_to_circle(
+        primary_mask=primary_mask,
+        fallback_mask=fallback_mask,
+        hsv=hsv,
+        config=config,
+        local_center_x=refined_center_x,
+        local_center_y=refined_center_y,
+    )
+    if marker_detection.get("status") != "detected":
+        return None
+
+    return {
+        "circle": {
+            "center_x": refined_center_x,
+            "center_y": refined_center_y,
+            "radius": max(config.compass_radius_px, 1.0),
+            "score": refined_score,
+        },
+        "marker_detection": marker_detection,
+    }
 
 
 def _detect_compass_marker_relative_to_circle(
