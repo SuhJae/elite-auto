@@ -464,6 +464,63 @@ class TestStarportSell(unittest.TestCase):
                 ("ui_select", "select", 0),
                 ("ui_select", "down", 0),
                 ("ui_select", "select", 0),
+                ("ui_select", "right", 0),
+                ("press", "space", 1),
+                ("ui_select", "select", 0),
+                ("hold", "right", 0.0),
+                ("ui_select", "down", 0),
+                ("ui_select", "select", 0),
+                ("press", "backspace", 1),
+                ("press", "backspace", 1),
+                ("ui_select", "down", 0),
+            ],
+        )
+
+    def test_sell_from_starport_uses_carrier_market_path_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            cargo_path = Path(root) / "Cargo.json"
+            cargo_path.write_text(
+                """
+                {
+                  "Inventory": [
+                    {"Name": "$copper_name;", "Name_Localised": "Copper", "Count": 12}
+                  ]
+                }
+                """.strip(),
+                encoding="utf-8",
+            )
+            call_log: list[tuple[str, str, float | int]] = []
+            context = build_context(cargo_path, call_log=call_log)
+            action = SellFromStarport(
+                station_name="Moxon's Mojo",
+                commodity="Copper",
+                is_carrier=True,
+                is_top=True,
+                market_data_source=FakeMarketDataSource(build_snapshot()),
+                timings=self._fast_timings(),
+            )
+
+            with patch(
+                "app.actions.starport_sell.load_cargo_inventory",
+                side_effect=[
+                    {"copper": 12},
+                    {"copper": 0},
+                ],
+            ):
+                result = action.run(context)
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            call_log,
+            [
+                ("ui_select", "select", 0),
+                ("ui_select", "right", 0),
+                ("ui_select", "right", 0),
+                ("ui_select", "select", 0),
+                ("ui_select", "down", 0),
+                ("ui_select", "select", 0),
+                ("ui_select", "right", 0),
+                ("press", "space", 1),
                 ("ui_select", "select", 0),
                 ("hold", "right", 0.0),
                 ("ui_select", "down", 0),

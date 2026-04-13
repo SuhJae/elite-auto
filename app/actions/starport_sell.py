@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from itertools import groupby
 from pathlib import Path
@@ -56,7 +57,9 @@ class SellFromStarport:
     commodity: str
     market_data_source: MarketDataSource
     station_name: str | None = None
+    is_carrier: bool = False
     is_top: bool = False
+    market_validation: Callable[["MarketSnapshot"], Result | None] | None = None
     timings: StarportSellTimings = field(default_factory=StarportSellTimings)
 
     name = "sell_from_starport"
@@ -90,6 +93,7 @@ class SellFromStarport:
             extra={
                 "station_name": self.station_name,
                 "commodity": self.commodity,
+                "is_carrier": self.is_carrier,
                 "is_top": self.is_top,
                 "cargo_units_before": cargo_units_before,
             },
@@ -110,6 +114,11 @@ class SellFromStarport:
                         "market_id": snapshot.market_id,
                     },
                 )
+
+        if self.market_validation is not None:
+            validation_result = self.market_validation(snapshot)
+            if validation_result is not None and not validation_result.success:
+                return validation_result
 
         visible_items = get_sell_screen_items(snapshot)
         visible_names = {
@@ -176,27 +185,35 @@ class SellFromStarport:
             raise RuntimeError("Ship control is not available.")
 
         # Refuel + repair from station services before opening commodities.
-        ship_control.ui_select("up")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("right")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("right")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("down")
-        _pause(self.timings.key_interval_seconds)
+        if not self.is_carrier:
+            ship_control.ui_select("up")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("down")
+            _pause(self.timings.key_interval_seconds)
         ship_control.ui_select("select")
 
         time.sleep(self.timings.services_open_wait_seconds)
 
-        ship_control.ui_select("down")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
+        if self.is_carrier:
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
+        else:
+            ship_control.ui_select("down")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
 
         time.sleep(self.timings.market_open_wait_seconds)
 

@@ -182,6 +182,7 @@ class BuyFromStarport:
                 "purchased": self.commodity,
                 "requested": self.commodity,
                 "max_buy_price": self.max_buy_price,
+                "unit_buy_price": matching_item.buy_price if matching_item is not None else None,
             },
         )
 
