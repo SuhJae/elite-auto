@@ -18,9 +18,9 @@ from app.domain.result import Result
 # Edit these values for standalone testing of this file.
 STANDALONE_CONFIG_PATH: str | None = None
 STANDALONE_START_DELAY_SECONDS = 3.0
-STANDALONE_AUTO_LAUNCH_WAIT_SECONDS = 90.0
+STANDALONE_AUTO_LAUNCH_WAIT_SECONDS = 60.0
 STANDALONE_MASS_LOCK_POLL_INTERVAL_SECONDS = 1.0
-STANDALONE_POST_MASS_LOCK_CLEAR_WAIT_SECONDS = 20.0
+STANDALONE_POST_MASS_LOCK_CLEAR_WAIT_SECONDS = 5.0
 STANDALONE_MASS_LOCK_TIMEOUT_SECONDS = 600.0
 
 
@@ -28,9 +28,9 @@ STANDALONE_MASS_LOCK_TIMEOUT_SECONDS = 600.0
 class LeaveStationTimings:
     """Named timings for the leave-station sequence."""
 
-    auto_launch_wait_seconds: float = 90.0
+    auto_launch_wait_seconds: float = 60.0
     mass_lock_poll_interval_seconds: float = 1.0
-    post_mass_lock_clear_wait_seconds: float = 20.0
+    post_mass_lock_clear_wait_seconds: float = 5.0
     mass_lock_timeout_seconds: float = 600.0
 
 
@@ -54,6 +54,9 @@ class LeaveStation:
                 "Cannot run leave_station while already undocked.",
                 debug={"state": initial_state.to_debug_dict()},
             )
+            
+        ship_control.ui_select("down")
+        time.sleep(0.5)
 
         context.logger.info("Activating auto-launch")
         ship_control.ui_select("select")
@@ -72,12 +75,14 @@ class LeaveStation:
             )
 
         context.logger.info(
-            "Holding upward lateral thrust while clearing mass lock",
+            "Holding upward lateral thrust and full throttle while clearing mass lock",
             extra={
                 "thrust_up_binding": context.config.controls.thrust_up,
+                "throttle_percent": 100,
                 "mass_lock_timeout_seconds": self.timings.mass_lock_timeout_seconds,
             },
         )
+        ship_control.set_throttle_percent(100)
         input_adapter.key_down(context.config.controls.thrust_up)
         try:
             mass_lock_result = WaitForMassLockClear(
@@ -92,8 +97,8 @@ class LeaveStation:
                 debug=mass_lock_result.debug,
             )
 
-        time.sleep(self.timings.post_mass_lock_clear_wait_seconds)
         ship_control.set_throttle_percent(0)
+        time.sleep(self.timings.post_mass_lock_clear_wait_seconds)
 
         final_state = context.state_reader.snapshot()
         return Result.ok(
@@ -103,6 +108,7 @@ class LeaveStation:
                 "mass_locked": final_state.is_mass_locked,
                 "is_docked": final_state.is_docked,
                 "thrust_up_binding": context.config.controls.thrust_up,
+                "mass_lock_clear_throttle_percent": 100,
                 "post_mass_lock_clear_wait_seconds": self.timings.post_mass_lock_clear_wait_seconds,
             },
         )

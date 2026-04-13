@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from app.actions.align import AlignConfig, AlignToTargetCompass
 from app.actions.docking import DockingTimings, RequestDockingSequence
@@ -23,31 +25,62 @@ from app.domain.result import Result
 from app.state.market_reader import MarketReader
 from run import build_context
 
-DEFAULT_SOURCE_CONFIG = {
-    "station_name": "Khun Port",
-    "commodity_name": "Steel",
-    "market_name": None,
-    "is_carrier": False,
-    "auto_launch_wait_seconds": 60.0,
+DEFAULT_TRADE_CONFIG_PATH = Path(__file__).with_name("trade.config.json")
+REQUIRED_TRADE_CONFIG_KEYS = {
+    "source": (
+        "station_name",
+        "commodity_name",
+        "market_name",
+        "is_carrier",
+        "auto_launch_wait_seconds",
+    ),
+    "destination": (
+        "station_name",
+        "market_name",
+        "is_carrier",
+        "item_is_top",
+        "auto_launch_wait_seconds",
+    ),
+    "safety": (
+        "source_max_buy_price",
+        "min_profit_per_unit",
+        "destination_min_demand",
+    ),
+    "runtime": (
+        "start_delay_seconds",
+        "retry_attempts_per_state",
+        "retry_initial_wait_seconds",
+        "retry_max_wait_seconds",
+    ),
 }
-DEFAULT_DESTINATION_CONFIG = {
-    "station_name": "[BKRN] Event Horizon X5W-54J",
-    "market_name": None,
-    "is_carrier": True,
-    "item_is_top": True,
-    "auto_launch_wait_seconds": 45.0,
-}
-DEFAULT_SAFETY_CONFIG = {
-    "source_max_buy_price": 7000,
-    "min_profit_per_unit": 5000,
-    "destination_min_demand": 1000,
-}
-DEFAULT_RUNTIME_CONFIG = {
-    "start_delay_seconds": 3.0,
-    "retry_attempts_per_state": 5,
-    "retry_initial_wait_seconds": 10.0,
-    "retry_max_wait_seconds": 300.0,
-}
+
+
+def _load_trade_config(path: str | Path | None) -> dict[str, dict[str, object]]:
+    config_path = Path(path or DEFAULT_TRADE_CONFIG_PATH).expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Trade config file not found: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"Trade config file must contain a JSON object: {config_path}")
+
+    config: dict[str, dict[str, object]] = {}
+    for section, keys in REQUIRED_TRADE_CONFIG_KEYS.items():
+        section_value = raw.get(section)
+        if not isinstance(section_value, dict):
+            raise ValueError(f"Trade config section '{section}' must be an object in {config_path}")
+        missing_keys = [key for key in keys if key not in section_value]
+        if missing_keys:
+            missing = ", ".join(missing_keys)
+            raise ValueError(f"Trade config section '{section}' is missing required keys: {missing}")
+        config[section] = section_value
+    return config
+
+
+def _resolve_cli_value(cli_value: object, config_value: object) -> object:
+    return config_value if cli_value is None else cli_value
 
 
 def _default_market_name(station_name: str, is_carrier: bool) -> str:
@@ -102,14 +135,14 @@ class TradeFsm:
     commodity_name: str
     destination_name: str
     market_data_source: MarketDataSource
-    source_is_carrier: bool = DEFAULT_SOURCE_CONFIG["is_carrier"]
-    destination_is_carrier: bool = DEFAULT_DESTINATION_CONFIG["is_carrier"]
+    source_is_carrier: bool = False
+    destination_is_carrier: bool = True
     source_market_name: str | None = None
     destination_market_name: str | None = None
-    source_max_buy_price: int | None = DEFAULT_SAFETY_CONFIG["source_max_buy_price"]
-    destination_item_is_top: bool = DEFAULT_DESTINATION_CONFIG["item_is_top"]
-    min_profit_per_unit: int = DEFAULT_SAFETY_CONFIG["min_profit_per_unit"]
-    destination_min_demand: int = DEFAULT_SAFETY_CONFIG["destination_min_demand"]
+    source_max_buy_price: int | None = 7000
+    destination_item_is_top: bool = True
+    min_profit_per_unit: int = 5000
+    destination_min_demand: int = 1000
     buy_timings: StarportBuyTimings = field(default_factory=StarportBuyTimings)
     sell_timings: StarportSellTimings = field(default_factory=StarportSellTimings)
     leave_station_timings: LeaveStationTimings = field(default_factory=LeaveStationTimings)
@@ -139,11 +172,11 @@ class TradeFsm:
     fsd_timings: FsdTimings = field(default_factory=FsdTimings)
     docking_timings: DockingTimings = field(default_factory=DockingTimings)
     cycle_limit: int | None = None
-    retry_attempts_per_state: int = DEFAULT_RUNTIME_CONFIG["retry_attempts_per_state"]
-    retry_initial_wait_seconds: float = DEFAULT_RUNTIME_CONFIG["retry_initial_wait_seconds"]
-    retry_max_wait_seconds: float = DEFAULT_RUNTIME_CONFIG["retry_max_wait_seconds"]
-    source_auto_launch_wait_seconds: float = DEFAULT_SOURCE_CONFIG["auto_launch_wait_seconds"]
-    destination_auto_launch_wait_seconds: float = DEFAULT_DESTINATION_CONFIG["auto_launch_wait_seconds"]
+    retry_attempts_per_state: int = 5
+    retry_initial_wait_seconds: float = 10.0
+    retry_max_wait_seconds: float = 300.0
+    source_auto_launch_wait_seconds: float = 60.0
+    destination_auto_launch_wait_seconds: float = 45.0
     initial_state: TradeState = TradeState.BUY_FROM_SOURCE
     last_source_buy_price: int | None = field(default=None, init=False)
     allow_one_unverified_sell: bool = field(default=False, init=False)
@@ -435,6 +468,15 @@ class TradeFsm:
             timings=self.sell_timings,
         ).run(context)
 
+    def _leave_station_action(self, auto_launch_wait_seconds: float) -> LeaveStation:
+        leave_timings = LeaveStationTimings(
+            auto_launch_wait_seconds=auto_launch_wait_seconds,
+            mass_lock_poll_interval_seconds=self.leave_station_timings.mass_lock_poll_interval_seconds,
+            post_mass_lock_clear_wait_seconds=self.leave_station_timings.post_mass_lock_clear_wait_seconds,
+            mass_lock_timeout_seconds=self.leave_station_timings.mass_lock_timeout_seconds,
+        )
+        return LeaveStation(timings=leave_timings)
+
     def _build_action(self, state: TradeState):
         if state is TradeState.BUY_FROM_SOURCE:
             return BuyFromStarport(
@@ -446,25 +488,9 @@ class TradeFsm:
                 timings=self.buy_timings,
             )
         if state is TradeState.LEAVE_SOURCE:
-            leave_timings = self.leave_station_timings
-            if self.source_is_carrier and leave_timings.auto_launch_wait_seconds == LeaveStationTimings().auto_launch_wait_seconds:
-                leave_timings = LeaveStationTimings(
-                    auto_launch_wait_seconds=self.source_auto_launch_wait_seconds,
-                    mass_lock_poll_interval_seconds=leave_timings.mass_lock_poll_interval_seconds,
-                    post_mass_lock_clear_wait_seconds=leave_timings.post_mass_lock_clear_wait_seconds,
-                    mass_lock_timeout_seconds=leave_timings.mass_lock_timeout_seconds,
-                )
-            return LeaveStation(timings=leave_timings)
+            return self._leave_station_action(self.source_auto_launch_wait_seconds)
         if state is TradeState.LEAVE_DESTINATION:
-            leave_timings = self.leave_station_timings
-            if self.destination_is_carrier and leave_timings.auto_launch_wait_seconds == LeaveStationTimings().auto_launch_wait_seconds:
-                leave_timings = LeaveStationTimings(
-                    auto_launch_wait_seconds=self.destination_auto_launch_wait_seconds,
-                    mass_lock_poll_interval_seconds=leave_timings.mass_lock_poll_interval_seconds,
-                    post_mass_lock_clear_wait_seconds=leave_timings.post_mass_lock_clear_wait_seconds,
-                    mass_lock_timeout_seconds=leave_timings.mass_lock_timeout_seconds,
-                )
-            return LeaveStation(timings=leave_timings)
+            return self._leave_station_action(self.destination_auto_launch_wait_seconds)
         if state is TradeState.LOCK_NAV_TO_DESTINATION:
             return LockNavDestination(
                 target_name=self.destination_name,
@@ -493,15 +519,15 @@ class TradeFsm:
 
     def _next_state(self, state: TradeState, completed_cycles: int) -> tuple[TradeState, int]:
         transitions = {
-            TradeState.BUY_FROM_SOURCE: TradeState.LEAVE_SOURCE,
-            TradeState.LEAVE_SOURCE: TradeState.LOCK_NAV_TO_DESTINATION,
-            TradeState.LOCK_NAV_TO_DESTINATION: TradeState.ALIGN_TO_DESTINATION,
+            TradeState.BUY_FROM_SOURCE: TradeState.LOCK_NAV_TO_DESTINATION,
+            TradeState.LOCK_NAV_TO_DESTINATION: TradeState.LEAVE_SOURCE,
+            TradeState.LEAVE_SOURCE: TradeState.ALIGN_TO_DESTINATION,
+            TradeState.DOCK_AT_DESTINATION: TradeState.SELL_AT_DESTINATION,
+            TradeState.SELL_AT_DESTINATION: TradeState.LOCK_NAV_TO_SOURCE,
+            TradeState.LOCK_NAV_TO_SOURCE: TradeState.LEAVE_DESTINATION,
+            TradeState.LEAVE_DESTINATION: TradeState.ALIGN_TO_SOURCE,
             TradeState.ALIGN_TO_DESTINATION: TradeState.ENGAGE_FSD_TO_DESTINATION,
             TradeState.ENGAGE_FSD_TO_DESTINATION: TradeState.DOCK_AT_DESTINATION,
-            TradeState.DOCK_AT_DESTINATION: TradeState.SELL_AT_DESTINATION,
-            TradeState.SELL_AT_DESTINATION: TradeState.LEAVE_DESTINATION,
-            TradeState.LEAVE_DESTINATION: TradeState.LOCK_NAV_TO_SOURCE,
-            TradeState.LOCK_NAV_TO_SOURCE: TradeState.ALIGN_TO_SOURCE,
             TradeState.ALIGN_TO_SOURCE: TradeState.ENGAGE_FSD_TO_SOURCE,
             TradeState.ENGAGE_FSD_TO_SOURCE: TradeState.DOCK_AT_SOURCE,
         }
@@ -526,18 +552,15 @@ def _normalize_commodity_name(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
 
-def build_default_fsm(
+def build_trade_fsm(
     config: AppConfig,
-    source_config: dict[str, object] | None = None,
-    destination_config: dict[str, object] | None = None,
-    safety_config: dict[str, object] | None = None,
-    runtime_config: dict[str, object] | None = None,
+    trade_config: dict[str, dict[str, object]],
     logger: logging.Logger | None = None,
 ) -> TradeFsm:
-    source = {**DEFAULT_SOURCE_CONFIG, **(source_config or {})}
-    destination = {**DEFAULT_DESTINATION_CONFIG, **(destination_config or {})}
-    safety = {**DEFAULT_SAFETY_CONFIG, **(safety_config or {})}
-    runtime = {**DEFAULT_RUNTIME_CONFIG, **(runtime_config or {})}
+    source = trade_config["source"]
+    destination = trade_config["destination"]
+    safety = trade_config["safety"]
+    runtime = trade_config["runtime"]
     market_reader = MarketReader(
         market_path=config.paths.market_file,
         journal_dir=config.paths.journal_dir,
@@ -582,63 +605,74 @@ def parse_start_stage(value: str) -> TradeState:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the trade FSM.")
     parser.add_argument("--config", help="Optional path to a JSON config file.")
-    parser.add_argument("--source-station", default=DEFAULT_SOURCE_CONFIG["station_name"], help="Station to buy from.")
-    parser.add_argument("--commodity", default=DEFAULT_SOURCE_CONFIG["commodity_name"], help="Commodity to trade.")
-    parser.add_argument("--destination", default=DEFAULT_DESTINATION_CONFIG["station_name"], help="Station to sell at.")
+    parser.add_argument(
+        "--trade-config",
+        default=str(DEFAULT_TRADE_CONFIG_PATH),
+        help="Path to the trade-specific JSON config file.",
+    )
+    parser.add_argument("--source-station", default=None, help="Station to buy from.")
+    parser.add_argument("--commodity", default=None, help="Commodity to trade.")
     parser.add_argument(
         "--source-market-name",
+        default=None,
         help="Optional station name as it appears in Market.json for the source buy location. Defaults to the carrier callsign for carrier sources.",
     )
     parser.add_argument(
         "--source-max-buy-price",
         type=int,
-        default=DEFAULT_SAFETY_CONFIG["source_max_buy_price"],
+        default=None,
         help="Proceed with source buy despite a station-name mismatch if the requested commodity is buyable at or below this price.",
     )
     parser.add_argument(
         "--source-is-carrier",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_SOURCE_CONFIG["is_carrier"],
+        default=None,
         help="Whether the source buy location uses the carrier services layout. Destination sell stays on station flow.",
     )
     parser.add_argument(
         "--source-auto-launch-wait-seconds",
         type=float,
-        default=DEFAULT_SOURCE_CONFIG["auto_launch_wait_seconds"],
+        default=None,
         help="Seconds to wait after auto-launch when leaving the source location if it is a carrier.",
+    )
+    parser.add_argument(
+        "--destination",
+        default=None,
+        help="Station to sell at.",
     )
     parser.add_argument(
         "--destination-item-is-top",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_DESTINATION_CONFIG["item_is_top"],
+        default=None,
         help="Whether the destination sell commodity is always the top row, allowing filter steps to be skipped.",
     )
     parser.add_argument(
         "--destination-is-carrier",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_DESTINATION_CONFIG["is_carrier"],
+        default=None,
         help="Whether the destination sell location uses the carrier services layout.",
     )
     parser.add_argument(
         "--destination-auto-launch-wait-seconds",
         type=float,
-        default=DEFAULT_DESTINATION_CONFIG["auto_launch_wait_seconds"],
+        default=None,
         help="Seconds to wait after auto-launch when leaving the destination location if it is a carrier.",
     )
     parser.add_argument(
         "--destination-market-name",
+        default=None,
         help="Optional station name as it appears in Market.json for the destination sell location. Defaults to the carrier callsign for carrier destinations.",
     )
     parser.add_argument(
         "--min-profit-per-unit",
         type=int,
-        default=DEFAULT_SAFETY_CONFIG["min_profit_per_unit"],
+        default=None,
         help="Minimum credits of profit required per unit before destination sell is allowed.",
     )
     parser.add_argument(
         "--destination-min-demand",
         type=int,
-        default=DEFAULT_SAFETY_CONFIG["destination_min_demand"],
+        default=None,
         help="Minimum destination demand required before selling at a non-carrier station.",
     )
     parser.add_argument(
@@ -654,13 +688,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--retry-attempts",
         type=int,
-        default=DEFAULT_RUNTIME_CONFIG["retry_attempts_per_state"],
+        default=None,
         help="Attempts per FSM state before quitting. Default: 5.",
     )
     parser.add_argument(
         "--start-delay",
         type=float,
-        default=DEFAULT_RUNTIME_CONFIG["start_delay_seconds"],
+        default=None,
         help="Seconds to wait before starting so the game window can be focused.",
     )
     return parser.parse_args()
@@ -669,39 +703,58 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = AppConfig.from_json(args.config) if args.config else AppConfig.default()
+    trade_config = _load_trade_config(args.trade_config)
     context = build_context(config)
-    source_config = {
-        "station_name": args.source_station,
-        "commodity_name": args.commodity,
-        "market_name": args.source_market_name,
-        "is_carrier": args.source_is_carrier,
-        "auto_launch_wait_seconds": args.source_auto_launch_wait_seconds,
-    }
-    destination_config = {
-        "station_name": args.destination,
-        "market_name": args.destination_market_name,
-        "is_carrier": args.destination_is_carrier,
-        "item_is_top": args.destination_item_is_top,
-        "auto_launch_wait_seconds": args.destination_auto_launch_wait_seconds,
-    }
-    safety_config = {
-        "source_max_buy_price": args.source_max_buy_price,
-        "min_profit_per_unit": args.min_profit_per_unit,
-        "destination_min_demand": args.destination_min_demand,
-    }
-    runtime_config = {
-        "retry_attempts_per_state": args.retry_attempts,
-        "retry_initial_wait_seconds": DEFAULT_RUNTIME_CONFIG["retry_initial_wait_seconds"],
-        "retry_max_wait_seconds": DEFAULT_RUNTIME_CONFIG["retry_max_wait_seconds"],
-    }
-    fsm = build_default_fsm(
-        config=config,
-        source_config=source_config,
-        destination_config=destination_config,
-        safety_config=safety_config,
-        runtime_config=runtime_config,
-        logger=context.logger,
+    trade_config["source"]["station_name"] = _resolve_cli_value(args.source_station, trade_config["source"]["station_name"])
+    trade_config["source"]["commodity_name"] = _resolve_cli_value(args.commodity, trade_config["source"]["commodity_name"])
+    trade_config["source"]["market_name"] = _resolve_cli_value(args.source_market_name, trade_config["source"]["market_name"])
+    trade_config["source"]["is_carrier"] = _resolve_cli_value(args.source_is_carrier, trade_config["source"]["is_carrier"])
+    trade_config["source"]["auto_launch_wait_seconds"] = _resolve_cli_value(
+        args.source_auto_launch_wait_seconds,
+        trade_config["source"]["auto_launch_wait_seconds"],
     )
+
+    trade_config["destination"]["station_name"] = _resolve_cli_value(args.destination, trade_config["destination"]["station_name"])
+    trade_config["destination"]["market_name"] = _resolve_cli_value(
+        args.destination_market_name,
+        trade_config["destination"]["market_name"],
+    )
+    trade_config["destination"]["is_carrier"] = _resolve_cli_value(
+        args.destination_is_carrier,
+        trade_config["destination"]["is_carrier"],
+    )
+    trade_config["destination"]["item_is_top"] = _resolve_cli_value(
+        args.destination_item_is_top,
+        trade_config["destination"]["item_is_top"],
+    )
+    trade_config["destination"]["auto_launch_wait_seconds"] = _resolve_cli_value(
+        args.destination_auto_launch_wait_seconds,
+        trade_config["destination"]["auto_launch_wait_seconds"],
+    )
+
+    trade_config["safety"]["source_max_buy_price"] = _resolve_cli_value(
+        args.source_max_buy_price,
+        trade_config["safety"]["source_max_buy_price"],
+    )
+    trade_config["safety"]["min_profit_per_unit"] = _resolve_cli_value(
+        args.min_profit_per_unit,
+        trade_config["safety"]["min_profit_per_unit"],
+    )
+    trade_config["safety"]["destination_min_demand"] = _resolve_cli_value(
+        args.destination_min_demand,
+        trade_config["safety"]["destination_min_demand"],
+    )
+
+    trade_config["runtime"]["retry_attempts_per_state"] = _resolve_cli_value(
+        args.retry_attempts,
+        trade_config["runtime"]["retry_attempts_per_state"],
+    )
+    trade_config["runtime"]["start_delay_seconds"] = _resolve_cli_value(
+        args.start_delay,
+        trade_config["runtime"]["start_delay_seconds"],
+    )
+
+    fsm = build_trade_fsm(config=config, trade_config=trade_config, logger=context.logger)
     fsm.cycle_limit = args.cycle_limit
     if args.start_stage is not None:
         fsm.initial_state = args.start_stage
@@ -709,9 +762,10 @@ def main() -> int:
             fsm.allow_one_unverified_sell = True
     fsm.retry_attempts_per_state = max(1, fsm.retry_attempts_per_state)
 
-    if args.start_delay > 0:
-        print(f"Warning: focusing game window. Starting trade in {args.start_delay:.1f} seconds...")
-        time.sleep(args.start_delay)
+    start_delay = float(trade_config["runtime"]["start_delay_seconds"])
+    if start_delay > 0:
+        print(f"Warning: focusing game window. Starting trade in {start_delay:.1f} seconds...")
+        time.sleep(start_delay)
 
     try:
         result = fsm.run(context)

@@ -136,7 +136,7 @@ class TestLeaveStation(unittest.TestCase):
         result = action.run(context)
 
         self.assertTrue(result.success)
-        self.assertEqual(ship_control.calls, [("ui_select", "select"), ("throttle", 0)])
+        self.assertEqual(ship_control.calls, [("ui_select", "select"), ("throttle", 100), ("throttle", 0)])
         self.assertEqual(input_adapter.calls, [("key_down", "r", 0.0), ("key_up", "r", 0.0)])
 
     def test_leave_station_rejects_already_undocked(self) -> None:
@@ -181,6 +181,7 @@ class TestLeaveStation(unittest.TestCase):
         result = action.run(context)
 
         self.assertFalse(result.success)
+        self.assertEqual(ship_control.calls, [("ui_select", "select"), ("throttle", 100)])
         self.assertEqual(input_adapter.calls, [("key_down", "r", 0.0), ("key_up", "r", 0.0)])
 
 

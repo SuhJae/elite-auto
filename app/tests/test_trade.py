@@ -5,11 +5,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app.actions.leave_station import LeaveStationTimings
 from app.config import AppConfig
 from app.domain.context import Context
 from app.domain.models import CommodityListing, MarketSnapshot, ShipState
 from app.domain.result import Result
-from trade import DEFAULT_SAFETY_CONFIG, DEFAULT_SOURCE_CONFIG, TradeFsm, TradeState, parse_start_stage
+from trade import (
+    TradeFsm,
+    TradeState,
+    parse_start_stage,
+)
 
 
 class FakeStateReader:
@@ -195,7 +200,7 @@ class TestTradeFsm(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(captured_kwargs["station_name"], "BZL-59X")
-        self.assertEqual(captured_kwargs["max_buy_price"], DEFAULT_SAFETY_CONFIG["source_max_buy_price"])
+        self.assertEqual(captured_kwargs["max_buy_price"], 7000)
 
     def test_trade_fsm_passes_top_item_flag_to_destination_sell(self) -> None:
         context = build_context()
@@ -515,7 +520,72 @@ class TestTradeFsm(unittest.TestCase):
 
         self.assertFalse(result.success)
         timings = captured_kwargs["timings"]
-        self.assertEqual(timings.auto_launch_wait_seconds, DEFAULT_SOURCE_CONFIG["auto_launch_wait_seconds"])
+        self.assertEqual(timings.auto_launch_wait_seconds, 60.0)
+
+    def test_trade_fsm_uses_destination_leave_wait(self) -> None:
+        context = build_context()
+        fsm = TradeFsm(
+            source_station_name="Khun Port",
+            commodity_name="Steel",
+            destination_name="[BKRN] Event Horizon X5W-54J",
+            market_data_source=FakeMarketDataSource(),
+            destination_is_carrier=True,
+            cycle_limit=1,
+            initial_state=TradeState.LEAVE_DESTINATION,
+            retry_attempts_per_state=1,
+        )
+
+        captured_kwargs: dict[str, object] = {}
+
+        def build_leave_action(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return RecordingAction("leave_station", Result.fail("stop"), [])
+
+        with patch("trade.LeaveStation", side_effect=build_leave_action):
+            result = fsm.run(context)
+
+        self.assertFalse(result.success)
+        timings = captured_kwargs["timings"]
+        self.assertEqual(timings.auto_launch_wait_seconds, 45.0)
+
+    def test_trade_fsm_preserves_other_leave_timings_when_overriding_wait(self) -> None:
+        context = build_context()
+        shared_timings = LeaveStationTimings(
+            auto_launch_wait_seconds=12.0,
+            mass_lock_poll_interval_seconds=2.5,
+            post_mass_lock_clear_wait_seconds=33.0,
+            mass_lock_timeout_seconds=700.0,
+        )
+        fsm = TradeFsm(
+            source_station_name="Khun Port",
+            commodity_name="Steel",
+            destination_name="[BKRN] Event Horizon X5W-54J",
+            market_data_source=FakeMarketDataSource(),
+            leave_station_timings=shared_timings,
+            destination_auto_launch_wait_seconds=45.0,
+            cycle_limit=1,
+            initial_state=TradeState.LEAVE_DESTINATION,
+            retry_attempts_per_state=1,
+        )
+
+        captured_kwargs: dict[str, object] = {}
+
+        def build_leave_action(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return RecordingAction("leave_station", Result.fail("stop"), [])
+
+        with patch("trade.LeaveStation", side_effect=build_leave_action):
+            result = fsm.run(context)
+
+        self.assertFalse(result.success)
+        timings = captured_kwargs["timings"]
+        self.assertEqual(timings.auto_launch_wait_seconds, 45.0)
+        self.assertEqual(timings.mass_lock_poll_interval_seconds, shared_timings.mass_lock_poll_interval_seconds)
+        self.assertEqual(
+            timings.post_mass_lock_clear_wait_seconds,
+            shared_timings.post_mass_lock_clear_wait_seconds,
+        )
+        self.assertEqual(timings.mass_lock_timeout_seconds, shared_timings.mass_lock_timeout_seconds)
 
     def test_trade_fsm_runs_expected_action_order(self) -> None:
         call_log: list[str] = []
@@ -570,14 +640,14 @@ class TestTradeFsm(unittest.TestCase):
             call_log,
             [
                 "buy_from_starport",
-                "leave_station",
                 "lock_nav_destination",
+                "leave_station",
                 "align_to_target_compass",
                 "engage_fsd_sequence",
                 "request_docking_sequence",
                 "sell_from_starport",
-                "leave_station",
                 "lock_nav_destination",
+                "leave_station",
                 "align_to_target_compass",
                 "engage_fsd_sequence",
                 "request_docking_sequence",
@@ -614,7 +684,7 @@ class TestTradeFsm(unittest.TestCase):
             result = fsm.run(context)
 
         self.assertFalse(result.success)
-        self.assertEqual(call_log, ["buy_from_starport", "leave_station"])
+        self.assertEqual(call_log, ["buy_from_starport", "lock_nav_destination", "leave_station"])
         self.assertIn("leave_source", result.reason)
 
     def test_trade_fsm_can_start_from_requested_stage(self) -> None:
@@ -664,8 +734,8 @@ class TestTradeFsm(unittest.TestCase):
             call_log,
             [
                 "sell_from_starport",
-                "leave_station",
                 "lock_nav_destination",
+                "leave_station",
                 "align_to_target_compass",
                 "engage_fsd_sequence",
                 "request_docking_sequence",

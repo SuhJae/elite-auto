@@ -1,0 +1,27 @@
+{
+  "source": {
+    "station_name": "Khun Port",
+    "commodity_name": "Steel",
+    "market_name": null,
+    "is_carrier": false,
+    "auto_launch_wait_seconds": 60.0
+  },
+  "destination": {
+    "station_name": "[BKRN] Event Horizon X5W-54J",
+    "market_name": null,
+    "is_carrier": true,
+    "item_is_top": true,
+    "auto_launch_wait_seconds": 45.0
+  },
+  "safety": {
+    "source_max_buy_price": 7000,
+    "min_profit_per_unit": 5000,
+    "destination_min_demand": 1000
+  },
+  "runtime": {
+    "start_delay_seconds": 3.0,
+    "retry_attempts_per_state": 5,
+    "retry_initial_wait_seconds": 10.0,
+    "retry_max_wait_seconds": 300.0
+  }
+}

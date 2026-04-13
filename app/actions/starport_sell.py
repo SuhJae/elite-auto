@@ -300,9 +300,6 @@ class SellFromStarport:
         input_adapter.press(context.config.controls.ui_back)
         _pause(self.timings.post_back_wait_seconds)
 
-        ship_control.ui_select("down")
-        _pause(self.timings.key_interval_seconds)
-
 
 def print_sell_screen(snapshot: "MarketSnapshot", cargo_inventory: dict[str, int] | None = None) -> None:
     print(render_sell_screen(snapshot, cargo_inventory=cargo_inventory))

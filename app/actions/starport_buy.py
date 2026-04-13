@@ -253,9 +253,6 @@ class BuyFromStarport:
         input_adapter.press(context.config.controls.ui_back)
         _pause(self.timings.post_back_wait_seconds)
 
-        ship_control.ui_select("down")
-        _pause(self.timings.key_interval_seconds)
-
 
 def print_buy_screen(snapshot: "MarketSnapshot") -> None:
     print(render_buy_screen(snapshot))
