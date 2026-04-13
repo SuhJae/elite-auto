@@ -565,6 +565,41 @@ class TestStarportSell(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("did not reduce cargo", result.reason.lower())
 
+    def test_sell_from_starport_can_ignore_station_mismatch_when_market_validation_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            cargo_path = Path(root) / "Cargo.json"
+            cargo_path.write_text(
+                """
+                {
+                  "Inventory": [
+                    {"Name": "$copper_name;", "Name_Localised": "Copper", "Count": 12}
+                  ]
+                }
+                """.strip(),
+                encoding="utf-8",
+            )
+            call_log: list[tuple[str, str, float | int]] = []
+            context = build_context(cargo_path, call_log=call_log)
+            action = SellFromStarport(
+                station_name="Wrong Station",
+                commodity="Copper",
+                market_data_source=FakeMarketDataSource(build_snapshot()),
+                market_validation=lambda snapshot: None,
+                allow_station_mismatch_if_market_validation_passes=True,
+                timings=self._fast_timings(),
+            )
+
+            with patch(
+                "app.actions.starport_sell.load_cargo_inventory",
+                side_effect=[
+                    {"copper": 12},
+                    {"copper": 0},
+                ],
+            ):
+                result = action.run(context)
+
+        self.assertTrue(result.success)
+
 
 if __name__ == "__main__":
     unittest.main()

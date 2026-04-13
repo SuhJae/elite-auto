@@ -9,7 +9,7 @@ from app.config import AppConfig
 from app.domain.context import Context
 from app.domain.models import CommodityListing, MarketSnapshot, ShipState
 from app.domain.result import Result
-from trade import DEFAULT_SAFETY_CONFIG, TradeFsm, TradeState, parse_start_stage
+from trade import DEFAULT_SAFETY_CONFIG, DEFAULT_SOURCE_CONFIG, TradeFsm, TradeState, parse_start_stage
 
 
 class FakeStateReader:
@@ -515,7 +515,7 @@ class TestTradeFsm(unittest.TestCase):
 
         self.assertFalse(result.success)
         timings = captured_kwargs["timings"]
-        self.assertEqual(timings.auto_launch_wait_seconds, 45.0)
+        self.assertEqual(timings.auto_launch_wait_seconds, DEFAULT_SOURCE_CONFIG["auto_launch_wait_seconds"])
 
     def test_trade_fsm_runs_expected_action_order(self) -> None:
         call_log: list[str] = []

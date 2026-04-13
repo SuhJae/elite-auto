@@ -60,6 +60,7 @@ class SellFromStarport:
     is_carrier: bool = False
     is_top: bool = False
     market_validation: Callable[["MarketSnapshot"], Result | None] | None = None
+    allow_station_mismatch_if_market_validation_passes: bool = False
     timings: StarportSellTimings = field(default_factory=StarportSellTimings)
 
     name = "sell_from_starport"
@@ -102,20 +103,38 @@ class SellFromStarport:
         self._open_station_services_and_market(context)
         snapshot = self.market_data_source.snapshot(required=True)
 
+        validation_result: Result | None = None
+
         if self.station_name:
             station_match = _normalize_text(snapshot.station_name) == _normalize_text(self.station_name)
             if not station_match:
-                return Result.fail(
-                    "Opened market does not match the requested station.",
-                    debug={
-                        "expected_station": self.station_name,
-                        "actual_station": snapshot.station_name,
-                        "star_system": snapshot.star_system,
-                        "market_id": snapshot.market_id,
-                    },
-                )
+                if self.allow_station_mismatch_if_market_validation_passes and self.market_validation is not None:
+                    validation_result = self.market_validation(snapshot)
+                    if validation_result is None or validation_result.success:
+                        context.logger.warning(
+                            "Opened market station name did not match, but proceeding because market validation passed.",
+                            extra={
+                                "expected_station": self.station_name,
+                                "actual_station": snapshot.station_name,
+                                "commodity": self.commodity,
+                                "star_system": snapshot.star_system,
+                                "market_id": snapshot.market_id,
+                            },
+                        )
+                    else:
+                        return validation_result
+                else:
+                    return Result.fail(
+                        "Opened market does not match the requested station.",
+                        debug={
+                            "expected_station": self.station_name,
+                            "actual_station": snapshot.station_name,
+                            "star_system": snapshot.star_system,
+                            "market_id": snapshot.market_id,
+                        },
+                    )
 
-        if self.market_validation is not None:
+        if self.market_validation is not None and validation_result is None:
             validation_result = self.market_validation(snapshot)
             if validation_result is not None and not validation_result.success:
                 return validation_result

@@ -1245,6 +1245,9 @@ def _target_match_score(target: str, candidate: str) -> float:
     if not target_tokens or not candidate_tokens:
         return _text_similarity(target, candidate)
 
+    target_code_tokens = [token for token in target_tokens if _is_station_code_token(token)]
+    candidate_code_tokens = [token for token in candidate_tokens if _is_station_code_token(token)]
+
     weighted_matches = 0.0
     weighted_possible = 0.0
     exact_code_matches = 0
@@ -1267,7 +1270,17 @@ def _target_match_score(target: str, candidate: str) -> float:
     token_score = weighted_matches / max(weighted_possible, 1.0)
     exact_bonus = min(0.22, (exact_core_matches * 0.02) + (fuzzy_core_matches * 0.05) + (exact_code_matches * 0.08))
     overall_score = _levenshtein_ratio(target, candidate)
-    return min(1.0, (token_score * 0.8) + (overall_score * 0.2) + exact_bonus)
+    score = min(1.0, (token_score * 0.8) + (overall_score * 0.2) + exact_bonus)
+
+    if target_code_tokens and candidate_code_tokens:
+        best_code_similarity = max(
+            (_nav_token_similarity(target_code, candidate_code) for target_code in target_code_tokens for candidate_code in candidate_code_tokens),
+            default=0.0,
+        )
+        if best_code_similarity < 0.85:
+            score *= 0.55
+
+    return score
 
 
 def _tokenize_nav_text(value: str) -> list[str]:

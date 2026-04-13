@@ -94,6 +94,19 @@ class TestNavigationOcrHelpers(unittest.TestCase):
 
         self.assertIsNone(_find_best_target_match(lines, "ptn trader", 0.72))
 
+    def test_find_best_target_match_penalizes_conflicting_carrier_code_even_when_name_is_similar(self) -> None:
+        lines = [
+            OcrLine(text="[BKRN] Event Horizon WZT-NXV", confidence=95.0, bbox=(0, 0, 10, 10)),
+            OcrLine(text="[BKRN] Event Horizon X5W-54J", confidence=70.0, bbox=(0, 15, 10, 10)),
+        ]
+
+        match = _find_best_target_match(lines, _normalize_nav_text("[BKRN] Event Horizon X5W-54J"), 0.72)
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match[0], 1)
+        self.assertEqual(match[1].text, "[BKRN] Event Horizon X5W-54J")
+
     def test_resolve_output_region_maps_absolute_window_to_monitor_relative_region(self) -> None:
         with patch(
             "app.actions.navigation_ocr._enumerate_display_monitors",

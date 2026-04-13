@@ -409,6 +409,7 @@ class TradeFsm:
                     market_data_source=self.market_data_source,
                     is_carrier=self.destination_is_carrier,
                     is_top=self.destination_item_is_top,
+                    allow_station_mismatch_if_market_validation_passes=True,
                     timings=self.sell_timings,
                 ).run(context)
                 if result.success:
@@ -430,6 +431,7 @@ class TradeFsm:
             is_carrier=self.destination_is_carrier,
             is_top=self.destination_item_is_top,
             market_validation=self._validate_destination_market,
+            allow_station_mismatch_if_market_validation_passes=True,
             timings=self.sell_timings,
         ).run(context)
 
