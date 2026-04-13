@@ -8,17 +8,34 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from app.actions.navigation_ocr import MoveCursorToNavTarget, OcrNavConfig, OcrNavTimings
-from app.actions.starport_buy import build_standalone_context
 from app.config import AppConfig
 from app.domain.context import Context
 from app.domain.result import Result
+
+try:
+    from app.actions.navigation_ocr import MoveCursorToNavTarget, OcrNavConfig, OcrNavTimings
+except ModuleNotFoundError:
+    class MoveCursorToNavTarget:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def run(self, context):
+            return Result.fail("Navigation OCR dependencies are not available in the current environment.")
+
+    @dataclass(slots=True)
+    class OcrNavTimings:  # type: ignore[no-redef]
+        move_interval_seconds: float = 0.2
+
+    @dataclass(slots=True)
+    class OcrNavConfig:  # type: ignore[no-redef]
+        save_debug_artifacts: bool = False
 
 
 # Edit these values for standalone testing of this file.
 STANDALONE_CONFIG_PATH: str | None = None
 STANDALONE_ACTION = "lock_nav_destination"
-STANDALONE_TARGET_NAME = "HILDEBRANDT REFINERY"
+# STANDALONE_TARGET_NAME = "ADENAUER SANCTUARY"
+STANDALONE_TARGET_NAME = "P.T.N. BLUE TRADER BZL-59X"
 STANDALONE_START_DELAY_SECONDS = 3.0
 STANDALONE_PANEL_OPEN_CONFIRM_TIMEOUT_SECONDS = 2.0
 STANDALONE_PANEL_OPEN_RETRY_COUNT = 3
@@ -28,6 +45,7 @@ STANDALONE_ANCHOR_HOLD_SECONDS = 10.0
 STANDALONE_ANCHOR_SETTLE_SECONDS = 0.5
 STANDALONE_LOCK_SELECT_INTERVAL_SECONDS = 0.5
 STANDALONE_BACK_TO_COCKPIT_WAIT_SECONDS = 0.5
+STANDALONE_SAVE_DEBUG_ARTIFACTS = True
 
 LEFT_PANEL_GUI_FOCUS = 2
 
@@ -139,6 +157,7 @@ class LockNavDestination:
 
     target_name: str
     timings: NavigationTimings = field(default_factory=NavigationTimings)
+    ocr_config: OcrNavConfig = field(default_factory=OcrNavConfig)
 
     name = "lock_nav_destination"
 
@@ -158,7 +177,7 @@ class LockNavDestination:
         ocr_result = MoveCursorToNavTarget(
             target_name=self.target_name,
             timings=OcrNavTimings(move_interval_seconds=0.2),
-            config=OcrNavConfig(save_debug_artifacts=False),
+            config=self.ocr_config,
         ).run(context)
         if not ocr_result.success:
             return Result.fail(
@@ -211,6 +230,8 @@ class WaitForSupercruiseEntry:
 
 def _main() -> int:
     config = AppConfig.from_json(STANDALONE_CONFIG_PATH) if STANDALONE_CONFIG_PATH else AppConfig.default()
+    from app.actions.starport_buy import build_standalone_context
+
     context = build_standalone_context(config)
 
     if STANDALONE_START_DELAY_SECONDS > 0:
@@ -229,7 +250,11 @@ def _main() -> int:
     )
     action_map = {
         OpenNavPanel.name: OpenNavPanel(timings=timings),
-        LockNavDestination.name: LockNavDestination(target_name=STANDALONE_TARGET_NAME, timings=timings),
+        LockNavDestination.name: LockNavDestination(
+            target_name=STANDALONE_TARGET_NAME,
+            timings=timings,
+            ocr_config=OcrNavConfig(save_debug_artifacts=STANDALONE_SAVE_DEBUG_ARTIFACTS),
+        ),
     }
     action = action_map.get(STANDALONE_ACTION)
     if action is None:

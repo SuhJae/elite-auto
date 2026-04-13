@@ -48,7 +48,7 @@ class StarportBuyTimings:
     key_interval_seconds: float = 0.5
     list_step_interval_seconds: float = 0.1
     services_open_wait_seconds: float = 5.0
-    market_open_wait_seconds: float = 2.5
+    market_open_wait_seconds: float = 5.0
     buy_hold_seconds: float = 10.0
     post_buy_confirm_wait_seconds: float = 3.0
     post_back_wait_seconds: float = 2.0
@@ -61,6 +61,8 @@ class BuyFromStarport:
     station_name: str
     commodity: str
     market_data_source: MarketDataSource
+    is_carrier: bool = False
+    max_buy_price: int | None = None
     timings: StarportBuyTimings = field(default_factory=StarportBuyTimings)
 
     name = "buy_from_starport"
@@ -78,29 +80,65 @@ class BuyFromStarport:
 
         context.logger.info(
             "Starting starport buy routine",
-            extra={"station_name": self.station_name, "commodity": self.commodity},
+            extra={
+                "station_name": self.station_name,
+                "commodity": self.commodity,
+                "is_carrier": self.is_carrier,
+                "max_buy_price": self.max_buy_price,
+            },
         )
 
         self._open_station_services_and_market(context)
         snapshot = self.market_data_source.snapshot(required=True)
-
-        station_match = _normalize_text(snapshot.station_name) == _normalize_text(self.station_name)
-        if not station_match:
-            return Result.fail(
-                "Opened market does not match the requested station.",
-                debug={
-                    "expected_station": self.station_name,
-                    "actual_station": snapshot.station_name,
-                    "star_system": snapshot.star_system,
-                    "market_id": snapshot.market_id,
-                },
-            )
 
         commodity_name = _normalize_commodity_name(self.commodity)
         if not commodity_name:
             return Result.fail("A commodity name is required.", debug={"commodity": self.commodity})
 
         visible_items = get_buy_screen_items(snapshot)
+        matching_item = next(
+            (
+                commodity
+                for commodity in visible_items
+                if _normalize_commodity_name(_goods_name(commodity)) == commodity_name
+                or _normalize_commodity_name(commodity.name_localised or "") == commodity_name
+            ),
+            None,
+        )
+
+        station_match = _normalize_text(snapshot.station_name) == _normalize_text(self.station_name)
+        if not station_match:
+            if (
+                self.max_buy_price is not None
+                and matching_item is not None
+                and matching_item.buy_price <= self.max_buy_price
+            ):
+                context.logger.warning(
+                    "Opened market station name did not match, but proceeding because commodity price is within cap.",
+                    extra={
+                        "expected_station": self.station_name,
+                        "actual_station": snapshot.station_name,
+                        "commodity": self.commodity,
+                        "buy_price": matching_item.buy_price,
+                        "max_buy_price": self.max_buy_price,
+                        "star_system": snapshot.star_system,
+                        "market_id": snapshot.market_id,
+                    },
+                )
+            else:
+                return Result.fail(
+                    "Opened market does not match the requested station.",
+                    debug={
+                        "expected_station": self.station_name,
+                        "actual_station": snapshot.station_name,
+                        "star_system": snapshot.star_system,
+                        "market_id": snapshot.market_id,
+                        "commodity": self.commodity,
+                        "matched_buy_price": matching_item.buy_price if matching_item is not None else None,
+                        "max_buy_price": self.max_buy_price,
+                    },
+                )
+
         commodity_positions = {
             _normalize_commodity_name(_goods_name(commodity)): index
             for index, commodity in enumerate(visible_items, start=1)
@@ -143,6 +181,7 @@ class BuyFromStarport:
                 "station_name": snapshot.station_name,
                 "purchased": self.commodity,
                 "requested": self.commodity,
+                "max_buy_price": self.max_buy_price,
             },
         )
 
@@ -152,27 +191,35 @@ class BuyFromStarport:
             raise RuntimeError("Ship control is not available.")
 
         # Refuel + repair from station services.
-        ship_control.ui_select("up")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("right")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("right")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("down")
-        _pause(self.timings.key_interval_seconds)
+        if self.is_carrier is False:
+            ship_control.ui_select("up")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds) 
+            ship_control.ui_select("select")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("down")
+            _pause(self.timings.key_interval_seconds)
         ship_control.ui_select("select")
 
         time.sleep(self.timings.services_open_wait_seconds)
 
-        ship_control.ui_select("down")
-        _pause(self.timings.key_interval_seconds)
-        ship_control.ui_select("select")
+        if self.is_carrier:
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("right")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
+        else:
+            ship_control.ui_select("down")
+            _pause(self.timings.key_interval_seconds)
+            ship_control.ui_select("select")
 
         time.sleep(self.timings.market_open_wait_seconds)
 
@@ -190,7 +237,7 @@ class BuyFromStarport:
             _pause(self.timings.list_step_interval_seconds)
 
         ship_control.ui_select("select")
-        _pause(self.timings.key_interval_seconds)
+        _pause(self.timings.key_interval_seconds * 4)
 
         input_adapter.hold(context.config.controls.ui_right, self.timings.buy_hold_seconds)
         _pause(self.timings.key_interval_seconds)

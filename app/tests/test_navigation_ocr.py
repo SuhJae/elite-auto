@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 
 from app.actions.navigation_ocr import (
+    _crop_perspective_quad_horizontally,
     _crop_warped_roi,
     _effective_cursor_index,
     _estimate_row_slot,
@@ -55,6 +56,43 @@ class TestNavigationOcrHelpers(unittest.TestCase):
         self.assertEqual(match[0], 1)
         line = match[1]
         self.assertEqual(line.text, "Abraham Lincln")
+
+    def test_find_best_target_match_prefers_correct_ptn_station_over_other_ptn_rows(self) -> None:
+        lines = [
+            OcrLine(text="PIN CATBUY MAIU UAFE", confidence=57.8, bbox=(0, 0, 10, 10)),
+            OcrLine(text="P.IL.N. BLUE TRAUER BZL-DYA", confidence=65.8, bbox=(0, 15, 10, 10)),
+            OcrLine(text="PIN USHIMA GAHVEN", confidence=75.0, bbox=(0, 30, 10, 10)),
+            OcrLine(text="PIN YUSHINU GAHUEN 6", confidence=63.8, bbox=(0, 45, 10, 10)),
+            OcrLine(text="P.I.N. WHITE BNL-I GVW", confidence=60.6, bbox=(0, 60, 10, 10)),
+        ]
+
+        match = _find_best_target_match(lines, "ptn blue trader bzl 59x", 0.72)
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match[0], 1)
+        self.assertEqual(match[1].text, "P.IL.N. BLUE TRAUER BZL-DYA")
+
+    def test_find_best_target_match_accepts_fuzzy_checkpoint_ocr_for_full_ptn_name(self) -> None:
+        lines = [
+            OcrLine(text="PIN CATBUY MAIU UAFE", confidence=57.8, bbox=(0, 0, 10, 10)),
+            OcrLine(text="P.IL.N. BLUE TRAUER BZL-DYA", confidence=65.8, bbox=(0, 15, 10, 10)),
+        ]
+
+        match = _find_best_target_match(lines, "ptn catboy maid cafe b2b b7z", 0.72)
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match[0], 0)
+        self.assertEqual(match[1].text, "PIN CATBUY MAIU UAFE")
+
+    def test_find_best_target_match_rejects_ambiguous_prefix_only_ptn_request(self) -> None:
+        lines = [
+            OcrLine(text="P.T.N. BLUE TRADER BZL-59X", confidence=90.0, bbox=(0, 0, 10, 10)),
+            OcrLine(text="P.T.N. WHITE TRADER BNL-T3W", confidence=91.0, bbox=(0, 15, 10, 10)),
+        ]
+
+        self.assertIsNone(_find_best_target_match(lines, "ptn trader", 0.72))
 
     def test_resolve_output_region_maps_absolute_window_to_monitor_relative_region(self) -> None:
         with patch(
@@ -123,6 +161,50 @@ class TestNavigationOcrHelpers(unittest.TestCase):
         self.assertGreater(flattened.shape[0], 70)
         self.assertGreater(flattened.shape[1], 95)
 
+    def test_crop_perspective_quad_horizontally_insets_both_edges_along_trapezoid(self) -> None:
+        cropped = _crop_perspective_quad_horizontally(
+            (
+                (20, 10),
+                (24, 90),
+                (120, 14),
+                (126, 86),
+            ),
+            left_fraction=0.10,
+            right_fraction=0.80,
+        )
+
+        top_left, bottom_left, top_right, bottom_right = cropped
+        self.assertGreater(top_left[0], 20.0)
+        self.assertGreater(bottom_left[0], 24.0)
+        self.assertLess(top_right[0], 120.0)
+        self.assertLess(bottom_right[0], 126.0)
+
+    def test_warp_list_quad_respects_horizontal_perspective_crop(self) -> None:
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        uncropped = _warp_list_quad(
+            frame,
+            (
+                (20, 10),
+                (24, 90),
+                (160, 14),
+                (166, 86),
+            ),
+        )
+        cropped = _warp_list_quad(
+            frame,
+            (
+                (20, 10),
+                (24, 90),
+                (160, 14),
+                (166, 86),
+            ),
+            left_fraction=0.04,
+            right_fraction=0.80,
+        )
+
+        self.assertLessEqual(abs(cropped.shape[0] - uncropped.shape[0]), 2)
+        self.assertLess(cropped.shape[1], uncropped.shape[1])
+
     def test_prepare_direct_roi_for_ocr_returns_grayscale_image(self) -> None:
         image = np.zeros((20, 30, 3), dtype=np.uint8)
         processed = _prepare_direct_roi_for_ocr(image)
@@ -182,7 +264,7 @@ class TestNavigationOcrHelpers(unittest.TestCase):
 
         self.assertEqual(normal.shape, highlighted.shape)
         self.assertFalse(np.array_equal(normal, highlighted))
-        self.assertLess(normal.shape[1], int(40 * 2.4))
+        self.assertLess(normal.shape[1], int(40 * 3.1))
 
     def test_merge_slot_line_candidates_places_lines_into_expected_slots(self) -> None:
         lines = [
@@ -230,7 +312,7 @@ class TestNavigationOcrHelpers(unittest.TestCase):
         first_quad = ((1, 1), (1, 2), (3, 1), (3, 2))
         next_quad = ((4, 4), (4, 5), (6, 4), (6, 5))
 
-        self.assertEqual(_resolve_list_quad_points(0, first_quad, next_quad), first_quad)
+        self.assertEqual(_resolve_list_quad_points(0, first_quad, next_quad), ((1, -7), (1, -6), (3, -7), (3, -6)))
         self.assertEqual(_resolve_list_quad_points(2, first_quad, next_quad), next_quad)
 
     def test_crop_warped_roi_trims_right_twenty_percent(self) -> None:

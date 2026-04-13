@@ -200,6 +200,26 @@ class StructuredFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class ConsoleFormatter(logging.Formatter):
+    """Emit compact human-readable console logs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        timestamp = self.formatTime(record, self.datefmt)
+        extras = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in STANDARD_LOG_KEYS and not key.startswith("_")
+        }
+        extras_text = ""
+        if extras:
+            formatted_extras = ", ".join(f"{key}={value}" for key, value in sorted(extras.items()))
+            extras_text = f" | {formatted_extras}"
+        message = f"{timestamp} | {record.levelname:<7} | {record.getMessage()}{extras_text}"
+        if record.exc_info:
+            return f"{message}\n{self.formatException(record.exc_info)}"
+        return message
+
+
 def configure_logging(config: AppConfig, logger_name: str = "elite_auto") -> logging.Logger:
     """Create console and file logging with a lightweight structured formatter."""
 
@@ -211,13 +231,14 @@ def configure_logging(config: AppConfig, logger_name: str = "elite_auto") -> log
     if logger.handlers:
         return logger
 
-    formatter = StructuredFormatter()
+    console_formatter = ConsoleFormatter()
+    file_formatter = StructuredFormatter()
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(console_formatter)
 
     log_file = config.paths.logs_dir / "elite_auto.log"
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(file_formatter)
 
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)

@@ -145,6 +145,7 @@ class TestFsd(unittest.TestCase):
             [
                 ("charge_fsd", "supercruise"),
                 ("throttle", 100),
+                ("throttle", 0),
                 ("open_left_panel", None),
                 ("ui_select", "select"),
                 ("ui_select", "right"),

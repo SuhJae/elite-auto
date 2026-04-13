@@ -86,6 +86,7 @@ class EngageFsdSequence:
                 debug=entry_result.debug,
             )
 
+        ship_control.set_throttle_percent(0)
         self._run_nav_menu_sequence(context)
 
         disengage_result = WaitForFsdDisengage(

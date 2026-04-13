@@ -32,6 +32,13 @@ SUPPORTED_BINDING_TAGS: dict[str, str] = {
     "YawRightButton": "yaw_right",
 }
 
+UI_DIRECTION_BINDING_TAGS = {
+    "UI_Up",
+    "UI_Down",
+    "UI_Left",
+    "UI_Right",
+}
+
 SPECIAL_KEY_MAP = {
     "Key_Space": "space",
     "Key_Tab": "tab",
@@ -128,7 +135,10 @@ class EliteBindingsReader:
             node = root.find(xml_tag)
             if node is None:
                 continue
-            key = self._extract_keyboard_key(node)
+            if xml_tag in UI_DIRECTION_BINDING_TAGS:
+                key = self._extract_preferred_ui_direction_key(node)
+            else:
+                key = self._extract_keyboard_key(node)
             if key is None:
                 continue
             resolved[field_name] = key
@@ -183,6 +193,23 @@ class EliteBindingsReader:
             if converted is not None:
                 return converted
         return None
+
+    def _extract_preferred_ui_direction_key(self, node: ET.Element) -> str | None:
+        primary = node.find("Primary")
+        secondary = node.find("Secondary")
+        binding = node.find("Binding")
+
+        for candidate in (primary, secondary, binding):
+            if candidate is None:
+                continue
+            converted = _convert_elite_key_to_pydirectinput(
+                device=candidate.attrib.get("Device", ""),
+                raw_key=candidate.attrib.get("Key", ""),
+            )
+            if converted in {"up", "down", "left", "right"}:
+                return converted
+
+        return self._extract_keyboard_key(node)
 
 
 def _convert_elite_key_to_pydirectinput(device: str, raw_key: str) -> str | None:

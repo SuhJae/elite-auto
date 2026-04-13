@@ -67,6 +67,16 @@ class AlignConfig:
     confirmation_distance_tolerance_px: float = 6.0
     alignment_dwell_seconds: float = 0.20
     alignment_dwell_release_tolerance_px: float = 4.0
+    compass_pulse_enabled: bool = True
+    compass_pulse_settle_seconds: float = 1.5
+    compass_pulse_hold_candidates_seconds: tuple[float, ...] = (0.06, 0.09, 0.13, 0.18, 0.27, 0.40, 0.60, 0.90)
+    compass_pulse_pitch_prior_px_per_second: float = 14.0
+    compass_pulse_yaw_prior_px_per_second: float = 12.0
+    compass_pulse_model_ema_alpha: float = 0.30
+    compass_pulse_model_gain_min_px_per_second: float = 4.0
+    compass_pulse_model_gain_max_px_per_second: float = 250.0
+    compass_pulse_overshoot_guard_px: float = 3.0
+    compass_hollow_breakout_hold_seconds: float = 0.40
     near_center_consensus_enabled: bool = True
     near_center_consensus_trigger_distance_px: float = 6.0
     near_center_consensus_pause_seconds: float = 0.0

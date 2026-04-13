@@ -73,6 +73,14 @@ class FakeShipControl:
         return None
 
 
+class RecordingShipControl(FakeShipControl):
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def ui_select(self, direction: str = "select") -> None:
+        self.calls.append(direction)
+
+
 class FakeMarketDataSource:
     def __init__(self, snapshot: MarketSnapshot) -> None:
         self._snapshot = snapshot
@@ -101,6 +109,29 @@ def build_context(is_docked: bool) -> Context:
         event_stream=FakeEventStream(),
         input_adapter=FakeInputAdapter(),
         ship_control=FakeShipControl(),
+    )
+
+
+def build_context_with_ship_control(is_docked: bool, ship_control: FakeShipControl) -> Context:
+    logger = logging.getLogger("elite_auto.test_starport_buy")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    state = ShipState(
+        is_docked=is_docked,
+        is_mass_locked=False,
+        is_supercruise=False,
+        cargo_count=0,
+        gui_focus=None,
+        status_flags=0,
+    )
+    return Context(
+        config=AppConfig.default(),
+        logger=logger,
+        debug_snapshot_dir=Path("debug_snapshots"),
+        state_reader=FakeStateReader(state),
+        event_stream=FakeEventStream(),
+        input_adapter=FakeInputAdapter(),
+        ship_control=ship_control,
     )
 
 
@@ -208,6 +239,65 @@ class TestStarportBuy(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertIn("undocked", result.reason.lower())
+
+    def test_buy_from_starport_uses_carrier_market_path_when_enabled(self) -> None:
+        ship_control = RecordingShipControl()
+        action = BuyFromStarport(
+            station_name="Jameson Memorial",
+            commodity="Meta-Alloys",
+            market_data_source=FakeMarketDataSource(build_snapshot()),
+            is_carrier=True,
+            timings=self._fast_timings(),
+        )
+
+        result = action.run(build_context_with_ship_control(is_docked=True, ship_control=ship_control))
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            ship_control.calls,
+            [
+                "select",
+                "right",
+                "right",
+                "select",
+                "right",
+                "select",
+                "down",
+                "select",
+                "down",
+            ],
+        )
+
+    def test_buy_from_starport_allows_station_mismatch_when_price_is_within_cap(self) -> None:
+        snapshot = build_snapshot(buy_price=15000, stock=42)
+        snapshot.station_name = "BLX-91W"
+        action = BuyFromStarport(
+            station_name="BZZ-NTG",
+            commodity="Meta-Alloys",
+            market_data_source=FakeMarketDataSource(snapshot),
+            max_buy_price=15500,
+            timings=self._fast_timings(),
+        )
+
+        result = action.run(build_context(is_docked=True))
+
+        self.assertTrue(result.success)
+
+    def test_buy_from_starport_rejects_station_mismatch_when_price_exceeds_cap(self) -> None:
+        snapshot = build_snapshot(buy_price=16000, stock=42)
+        snapshot.station_name = "BLX-91W"
+        action = BuyFromStarport(
+            station_name="BZZ-NTG",
+            commodity="Meta-Alloys",
+            market_data_source=FakeMarketDataSource(snapshot),
+            max_buy_price=15500,
+            timings=self._fast_timings(),
+        )
+
+        result = action.run(build_context(is_docked=True))
+
+        self.assertFalse(result.success)
+        self.assertIn("does not match", result.reason.lower())
 
     def test_render_buy_screen_groups_and_sorts_categories_and_items(self) -> None:
         snapshot = MarketSnapshot(

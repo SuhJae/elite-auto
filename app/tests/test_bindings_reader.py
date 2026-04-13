@@ -94,7 +94,7 @@ class TestBindingsReader(unittest.TestCase):
             self.assertEqual(detected.controls.boost, "tab")
             self.assertEqual(detected.controls.open_left_panel, "1")
             self.assertEqual(detected.controls.cycle_next_panel, "e")
-            self.assertEqual(detected.controls.ui_up, "w")
+            self.assertEqual(detected.controls.ui_up, "up")
             self.assertEqual(detected.controls.ui_select, "space")
             self.assertEqual(detected.controls.charge_fsd, "j")
             self.assertEqual(detected.controls.thrust_up, "r")

@@ -56,7 +56,7 @@ STANDALONE_MATCH_THRESHOLD = 0.72
 STANDALONE_TESSERACT_PATH: str | None = None
 STANDALONE_EXPECTED_VISIBLE_ROWS = 11
 STANDALONE_USE_DIRECT_ROI_OCR = True
-STANDALONE_WARP_CROP_LEFT_FRACTION = 0.0
+STANDALONE_WARP_CROP_LEFT_FRACTION = 0.055
 STANDALONE_WARP_CROP_RIGHT_FRACTION = 0.80
 STANDALONE_SAVE_DEBUG_ARTIFACTS = True
 
@@ -106,7 +106,7 @@ class OcrNavConfig:
     match_threshold: float = 0.72
     tesseract_path: str | None = None
     use_direct_roi_ocr: bool = True
-    warp_crop_left_fraction: float = 0.0
+    warp_crop_left_fraction: float = 0.055
     warp_crop_right_fraction: float = 0.80
     save_debug_artifacts: bool = False
 
@@ -359,8 +359,12 @@ def _scan_nav_page(
     frame = capture.grab(region=capture_region)
     quad_points = _resolve_list_quad_points(page_index, list_quad_points, scrolled_list_quad_points)
     if quad_points is not None:
-        roi = _warp_list_quad(frame, quad_points)
-        roi = _crop_warped_roi(roi, warp_crop_left_fraction, warp_crop_right_fraction)
+        roi = _warp_list_quad(
+            frame,
+            quad_points,
+            left_fraction=warp_crop_left_fraction,
+            right_fraction=warp_crop_right_fraction,
+        )
     else:
         list_region = _scale_region(frame, list_region_fractions)
         roi = _crop_region(frame, list_region)
@@ -392,8 +396,14 @@ def _scan_nav_page(
 def _warp_list_quad(
     frame: np.ndarray,
     quad_points: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]],
+    left_fraction: float = 0.0,
+    right_fraction: float = 1.0,
 ) -> np.ndarray:
-    top_left, bottom_left, top_right, bottom_right = quad_points
+    top_left, bottom_left, top_right, bottom_right = _crop_perspective_quad_horizontally(
+        quad_points,
+        left_fraction,
+        right_fraction,
+    )
     src = np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.float32)
 
     top_width = float(np.linalg.norm(np.array(top_right) - np.array(top_left)))
@@ -416,14 +426,45 @@ def _warp_list_quad(
     return cv2.warpPerspective(frame, transform, (width, height))
 
 
+def _crop_perspective_quad_horizontally(
+    quad_points: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]],
+    left_fraction: float,
+    right_fraction: float,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
+    clamped_left = max(0.0, min(0.95, left_fraction))
+    clamped_right = max(clamped_left + 0.01, min(1.0, right_fraction))
+    top_left, bottom_left, top_right, bottom_right = quad_points
+
+    def _lerp(point_a: tuple[int, int], point_b: tuple[int, int], amount: float) -> tuple[float, float]:
+        ax, ay = point_a
+        bx, by = point_b
+        return (ax + ((bx - ax) * amount), ay + ((by - ay) * amount))
+
+    cropped_top_left = _lerp(top_left, top_right, clamped_left)
+    cropped_top_right = _lerp(top_left, top_right, clamped_right)
+    cropped_bottom_left = _lerp(bottom_left, bottom_right, clamped_left)
+    cropped_bottom_right = _lerp(bottom_left, bottom_right, clamped_right)
+    return cropped_top_left, cropped_bottom_left, cropped_top_right, cropped_bottom_right
+
+
 def _resolve_list_quad_points(
     page_index: int,
     first_page_quad_points: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None,
     scrolled_quad_points: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None,
 ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None:
     if page_index <= 0:
-        return first_page_quad_points
+        return _translate_quad_points(first_page_quad_points, offset_x=0, offset_y=-8)
     return scrolled_quad_points or first_page_quad_points
+
+
+def _translate_quad_points(
+    quad_points: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None,
+    offset_x: int,
+    offset_y: int,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+    if quad_points is None:
+        return None
+    return tuple((x + offset_x, y + offset_y) for x, y in quad_points)  # type: ignore[return-value]
 
 
 def _crop_warped_roi(image: np.ndarray, left_fraction: float, right_fraction: float) -> np.ndarray:
@@ -935,21 +976,25 @@ def _prepare_row_image_for_ocr(
     use_direct_roi_ocr: bool,
 ) -> np.ndarray:
     height, width = color_row.shape[:2]
-    text_start = min(width - 1, max(0, int(width * 0.05)))
-    text_end = min(width, max(text_start + 1, int(width * 0.96)))
+    text_start = min(width - 1, max(0, int(width * 0.01)))
+    text_end = min(width, max(text_start + 1, int(width * 0.99)))
     top_trim = max(0, int(height * 0.08))
     bottom_trim = min(height, max(top_trim + 1, int(height * 0.92)))
     row_color = color_row[top_trim:bottom_trim, text_start:text_end].copy()
     row_processed = processed_row[top_trim:bottom_trim, text_start:text_end].copy()
 
     if use_direct_roi_ocr:
-        enlarged = cv2.resize(row_color, None, fx=2.4, fy=2.4, interpolation=cv2.INTER_CUBIC)
+        enlarged = cv2.resize(row_color, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
         gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        if not highlighted:
-            gray = cv2.bitwise_not(gray)
-        return gray
+        if highlighted:
+            return cv2.bitwise_not(gray)
+
+        mask = _build_ui_text_mask(enlarged)
+        gray = cv2.bitwise_and(gray, gray, mask=mask)
+        _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return thresholded
 
     enlarged = cv2.resize(row_processed, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
     if highlighted:
@@ -988,7 +1033,7 @@ def _ocr_single_row_once(image: np.ndarray, tesseract_path: str, psm: str) -> st
             "--psm",
             psm,
             "-c",
-            "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'&:/<>+",
+            "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .-'&:/<>+",
             "quiet",
         ]
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -1036,7 +1081,7 @@ def _extract_ocr_lines_from_image(
             "--psm",
             psm,
             "-c",
-            "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -'&:/<>",
+            "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .-'&:/<>",
             "tsv",
             "quiet",
         ]
@@ -1133,14 +1178,29 @@ def _prefer_ocr_line(candidate: OcrLine, current: OcrLine) -> bool:
 
 
 def _find_best_target_match(lines: list[OcrLine], target_key: str, match_threshold: float) -> tuple[int, OcrLine] | None:
-    best_match: tuple[int, OcrLine] | None = None
-    best_score = 0.0
+    if not _target_has_minimum_specificity(target_key):
+        for index, line in enumerate(lines):
+            if _normalize_nav_text(line.text) == target_key:
+                return index, line
+        return None
+
+    ranked_matches: list[tuple[float, float, int, OcrLine]] = []
     for index, line in enumerate(lines):
-        score = _text_similarity(target_key, _normalize_nav_text(line.text))
-        if score >= match_threshold and score > best_score:
-            best_score = score
-            best_match = (index, line)
-    return best_match
+        candidate_key = _normalize_nav_text(line.text)
+        score = _target_match_score(target_key, candidate_key)
+        if score >= match_threshold:
+            ranked_matches.append((score, line.confidence, index, line))
+
+    if not ranked_matches:
+        return None
+
+    ranked_matches.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
+    best_score, _best_confidence, best_index, best_line = ranked_matches[0]
+    if len(ranked_matches) > 1:
+        runner_up_score = ranked_matches[1][0]
+        if best_score - runner_up_score < 0.025:
+            return None
+    return best_index, best_line
 
 
 def _resolve_target_row_index(
@@ -1172,6 +1232,103 @@ def _text_similarity(left: str, right: str) -> float:
     if left in right or right in left:
         return min(len(left), len(right)) / max(len(left), len(right))
     return _levenshtein_ratio(left, right)
+
+
+def _target_match_score(target: str, candidate: str) -> float:
+    if not target or not candidate:
+        return 0.0
+    if target == candidate:
+        return 1.0
+
+    target_tokens = _tokenize_nav_text(target)
+    candidate_tokens = _tokenize_nav_text(candidate)
+    if not target_tokens or not candidate_tokens:
+        return _text_similarity(target, candidate)
+
+    weighted_matches = 0.0
+    weighted_possible = 0.0
+    exact_code_matches = 0
+    exact_core_matches = 0
+    fuzzy_core_matches = 0
+
+    for token in target_tokens:
+        weight = _nav_token_weight(token)
+        best_similarity = max((_nav_token_similarity(token, other) for other in candidate_tokens), default=0.0)
+        weighted_matches += weight * best_similarity
+        weighted_possible += weight
+        if any(token == other for other in candidate_tokens):
+            if _is_station_code_token(token):
+                exact_code_matches += 1
+            elif token not in {"ptn", "nac"}:
+                exact_core_matches += 1
+        elif token not in {"ptn", "nac"} and len(token) >= 4 and best_similarity >= 0.72:
+            fuzzy_core_matches += 1
+
+    token_score = weighted_matches / max(weighted_possible, 1.0)
+    exact_bonus = min(0.22, (exact_core_matches * 0.02) + (fuzzy_core_matches * 0.05) + (exact_code_matches * 0.08))
+    overall_score = _levenshtein_ratio(target, candidate)
+    return min(1.0, (token_score * 0.8) + (overall_score * 0.2) + exact_bonus)
+
+
+def _tokenize_nav_text(value: str) -> list[str]:
+    return [_canonicalize_nav_token(token) for token in _normalize_nav_text(value).split() if token]
+
+
+def _nav_token_weight(token: str) -> float:
+    if token in {"ptn", "nac"}:
+        return 0.4
+    if _is_station_code_token(token):
+        return 2.8
+    if token.isdigit():
+        return 1.6
+    if len(token) >= 6:
+        return 1.6
+    if len(token) >= 4:
+        return 1.2
+    return 0.9
+
+
+def _canonicalize_nav_token(token: str) -> str:
+    if token in {"pin", "piln", "pitn", "piin"}:
+        return "ptn"
+    if token in {"nal", "nva"}:
+        return "nac"
+    return token
+
+
+def _target_has_minimum_specificity(target: str) -> bool:
+    informative_tokens = [
+        token
+        for token in _tokenize_nav_text(target)
+        if token not in {"ptn", "nac"} and len(token) >= 4 and token not in {"trader", "gateway", "garden", "beacon"}
+    ]
+    if informative_tokens:
+        return True
+    return any(_is_station_code_token(token) for token in _tokenize_nav_text(target))
+
+
+def _nav_token_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    if len(left) == 3 and left.isalpha() and len(right) >= 5 and right.startswith(left):
+        return 0.85
+    if len(right) == 3 and right.isalpha() and len(left) >= 5 and left.startswith(right):
+        return 0.85
+    if left in right or right in left:
+        if min(len(left), len(right)) <= 3:
+            return 0.0
+        return min(len(left), len(right)) / max(len(left), len(right))
+    return _levenshtein_ratio(left, right)
+
+
+def _is_station_code_token(token: str) -> bool:
+    if len(token) < 5:
+        return False
+    letters = sum(character.isalpha() for character in token)
+    digits = sum(character.isdigit() for character in token)
+    return letters >= 2 and digits >= 1
 
 
 def _levenshtein_ratio(left: str, right: str) -> float:

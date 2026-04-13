@@ -239,6 +239,25 @@ class _FinalPhaseControllerState:
 
 
 @dataclass(slots=True)
+class _CompassPulseControllerState:
+    mode: str = "choose_pulse"
+    command_models: dict[str, _FinalPhaseCommandModel] = field(default_factory=dict)
+    active_episode: _FinalPhaseEpisode | None = None
+    settle_until: float | None = None
+
+    @property
+    def is_waiting(self) -> bool:
+        return self.mode in {"pulse_active", "settling"}
+
+    def reset(self, config: AlignConfig, *, reset_models: bool = True) -> None:
+        self.mode = "choose_pulse"
+        if reset_models or not self.command_models:
+            self.command_models = _initial_compass_pulse_command_models(config)
+        self.active_episode = None
+        self.settle_until = None
+
+
+@dataclass(slots=True)
 class _AxisSmartNudgeState:
     axis: str
     last_command_sign: int = 0
@@ -973,6 +992,31 @@ def _create_final_phase_controller_state(config: AlignConfig) -> _FinalPhaseCont
     return state
 
 
+def _initial_compass_pulse_command_models(config: AlignConfig) -> dict[str, _FinalPhaseCommandModel]:
+    pitch_prior = _clamp(
+        config.compass_pulse_pitch_prior_px_per_second,
+        config.compass_pulse_model_gain_min_px_per_second,
+        config.compass_pulse_model_gain_max_px_per_second,
+    )
+    yaw_prior = _clamp(
+        config.compass_pulse_yaw_prior_px_per_second,
+        config.compass_pulse_model_gain_min_px_per_second,
+        config.compass_pulse_model_gain_max_px_per_second,
+    )
+    return {
+        "pitch_up": _FinalPhaseCommandModel(direction="pitch_up", axis="pitch", gain_px_per_second=pitch_prior),
+        "pitch_down": _FinalPhaseCommandModel(direction="pitch_down", axis="pitch", gain_px_per_second=pitch_prior),
+        "yaw_left": _FinalPhaseCommandModel(direction="yaw_left", axis="yaw", gain_px_per_second=yaw_prior),
+        "yaw_right": _FinalPhaseCommandModel(direction="yaw_right", axis="yaw", gain_px_per_second=yaw_prior),
+    }
+
+
+def _create_compass_pulse_controller_state(config: AlignConfig) -> _CompassPulseControllerState:
+    state = _CompassPulseControllerState()
+    state.reset(config)
+    return state
+
+
 def _pause_final_phase_confirmation(state: _FinalPhaseControllerState, now: float) -> None:
     if state.confirmation_started_at is None:
         return
@@ -1100,6 +1144,125 @@ def _update_final_phase_model_from_episode(
     return clamped_gain
 
 
+def _choose_compass_pulse_action(
+    *,
+    marker: CompassMarker,
+    state: _CompassPulseControllerState,
+    context: Context,
+    config: AlignConfig,
+) -> dict[str, Any]:
+    if marker.is_hollow and marker.distance <= config.center_tolerance_px:
+        hold_seconds = float(config.compass_hollow_breakout_hold_seconds)
+        return {
+            "direction": "pitch_up",
+            "axis": "pitch",
+            "key": context.config.controls.pitch_up,
+            "hold_seconds": hold_seconds,
+            "predicted_residual_px": marker.control_dy,
+            "score": abs(marker.control_dy),
+            "overshoot_rejected": False,
+            "reason": "hollow_breakout",
+        }
+
+    tolerance = max(1e-6, config.axis_alignment_tolerance_px)
+    pitch_needs = abs(marker.control_dy) > tolerance
+    yaw_needs = abs(marker.control_dx) > tolerance
+    if not pitch_needs and not yaw_needs:
+        return {
+            "direction": "noop",
+            "axis": None,
+            "key": None,
+            "hold_seconds": 0.0,
+            "predicted_residual_px": 0.0,
+            "score": 0.0,
+            "overshoot_rejected": False,
+            "reason": "aligned",
+        }
+
+    if pitch_needs and yaw_needs:
+        selected_axis = "pitch" if abs(marker.control_dy) >= abs(marker.control_dx) else "yaw"
+    elif pitch_needs:
+        selected_axis = "pitch"
+    else:
+        selected_axis = "yaw"
+
+    axis_error_px = marker.control_dy if selected_axis == "pitch" else marker.control_dx
+    other_error_px = marker.control_dx if selected_axis == "pitch" else marker.control_dy
+    direction = _final_phase_direction_for_error(selected_axis, axis_error_px)
+    model = state.command_models[direction]
+    sign = _sign(axis_error_px)
+    valid_candidates: list[dict[str, Any]] = []
+    rejected_candidates: list[dict[str, Any]] = []
+
+    for hold_seconds in config.compass_pulse_hold_candidates_seconds:
+        correction_px = model.gain_px_per_second * max(0.0, hold_seconds)
+        predicted_residual_px = axis_error_px - (sign * correction_px)
+        crosses_zero = _sign(predicted_residual_px) != 0 and _sign(predicted_residual_px) != sign
+        overshoot_rejected = crosses_zero and abs(predicted_residual_px) > config.compass_pulse_overshoot_guard_px
+        score = ((predicted_residual_px / tolerance) ** 2) + ((other_error_px / tolerance) ** 2)
+        candidate = {
+            "direction": direction,
+            "axis": selected_axis,
+            "key": _final_phase_direction_key(direction, context),
+            "hold_seconds": float(hold_seconds),
+            "predicted_residual_px": predicted_residual_px,
+            "score": score,
+            "overshoot_rejected": overshoot_rejected,
+            "reason": "axis_choice",
+        }
+        if overshoot_rejected:
+            rejected_candidates.append(candidate)
+        else:
+            valid_candidates.append(candidate)
+
+    if valid_candidates:
+        return min(valid_candidates, key=lambda candidate: (candidate["score"], candidate["hold_seconds"]))
+    return min(rejected_candidates, key=lambda candidate: candidate["hold_seconds"])
+
+
+def _update_compass_pulse_model_from_episode(
+    *,
+    state: _CompassPulseControllerState,
+    episode: _FinalPhaseEpisode,
+    marker: CompassMarker,
+    config: AlignConfig,
+) -> float:
+    error_after = marker.control_dy if episode.axis == "pitch" else marker.control_dx
+    improvement_px = max(0.0, abs(episode.commanded_error_px) - abs(error_after))
+    executed_hold_seconds = (
+        episode.actual_hold_seconds
+        if episode.actual_hold_seconds is not None
+        else episode.hold_seconds
+    )
+    observed_gain_px_per_second = improvement_px / max(executed_hold_seconds, 1e-6)
+    model = state.command_models[episode.direction]
+    alpha = _clamp(config.compass_pulse_model_ema_alpha, 0.0, 1.0)
+    clamped_gain = _clamp(
+        observed_gain_px_per_second,
+        config.compass_pulse_model_gain_min_px_per_second,
+        config.compass_pulse_model_gain_max_px_per_second,
+    )
+    model.gain_px_per_second = ((1.0 - alpha) * model.gain_px_per_second) + (alpha * clamped_gain)
+    model.gain_px_per_second = _clamp(
+        model.gain_px_per_second,
+        config.compass_pulse_model_gain_min_px_per_second,
+        config.compass_pulse_model_gain_max_px_per_second,
+    )
+    model.samples += 1
+    return clamped_gain
+
+
+def _compass_pulse_models_to_debug(state: _CompassPulseControllerState) -> dict[str, dict[str, Any]]:
+    return {
+        direction: {
+            "axis": model.axis,
+            "gain_px_per_second": round(model.gain_px_per_second, 3),
+            "samples": model.samples,
+        }
+        for direction, model in state.command_models.items()
+    }
+
+
 def _final_phase_models_to_debug(state: _FinalPhaseControllerState) -> dict[str, dict[str, Any]]:
     return {
         direction: {
@@ -1187,6 +1350,70 @@ def _compact_final_phase_for_loop_log(final_phase_debug: Any) -> dict[str, Any] 
             if isinstance(model, dict)
         }
     return compact
+
+
+def _compact_compass_phase_for_loop_log(compass_phase_debug: Any) -> dict[str, Any] | None:
+    if not isinstance(compass_phase_debug, dict):
+        return None
+    compact: dict[str, Any] = {"mode": compass_phase_debug.get("mode")}
+    selected_action = compass_phase_debug.get("selected_action")
+    if isinstance(selected_action, dict):
+        compact["selected_action"] = {
+            "direction": selected_action.get("direction"),
+            "axis": selected_action.get("axis"),
+            "hold_seconds": selected_action.get("hold_seconds"),
+            "predicted_residual_px": selected_action.get("predicted_residual_px"),
+            "reason": selected_action.get("reason"),
+        }
+    episode = compass_phase_debug.get("episode")
+    if isinstance(episode, dict):
+        compact["episode"] = {
+            "direction": episode.get("direction"),
+            "axis": episode.get("axis"),
+            "hold_seconds": episode.get("hold_seconds"),
+            "commanded_error_px": episode.get("commanded_error_px"),
+            "predicted_residual_px": episode.get("predicted_residual_px"),
+        }
+    if compass_phase_debug.get("observed_gain_px_per_second") is not None:
+        compact["observed_gain_px_per_second"] = compass_phase_debug.get("observed_gain_px_per_second")
+    models = compass_phase_debug.get("models")
+    if isinstance(models, dict):
+        compact["models"] = {
+            direction: {
+                "gain_px_per_second": model.get("gain_px_per_second"),
+                "samples": model.get("samples"),
+            }
+            for direction, model in models.items()
+            if isinstance(model, dict)
+        }
+    return compact
+
+
+def _compass_pulse_wait_deadline(state: _CompassPulseControllerState) -> float | None:
+    if state.mode == "pulse_active" and state.active_episode is not None:
+        return state.active_episode.pulse_end_at
+    if state.mode == "settling":
+        return state.settle_until
+    return None
+
+
+def _advance_compass_pulse_wait_state(
+    *,
+    state: _CompassPulseControllerState,
+    steering: _SteeringState,
+    now: float,
+    config: AlignConfig,
+) -> tuple[dict[str, Any] | None, bool]:
+    axis_update: dict[str, Any] | None = None
+    if state.mode == "pulse_active" and state.active_episode is not None and now >= state.active_episode.pulse_end_at:
+        axis_update = steering.update_axis_pulse(state.active_episode.axis, now)
+        if (axis_update.get("transition") or "").startswith("release:"):
+            state.active_episode.actual_hold_seconds = max(0.0, now - state.active_episode.started_at)
+            state.mode = "settling"
+            state.settle_until = now + config.compass_pulse_settle_seconds
+    if state.mode == "settling" and state.settle_until is not None and now >= state.settle_until:
+        return axis_update, True
+    return axis_update, False
 
 
 
@@ -1303,6 +1530,9 @@ class AlignToTargetCompass:
                     "alignment_tolerance_px": self.config.alignment_tolerance_px,
                     "axis_alignment_tolerance_px": self.config.axis_alignment_tolerance_px,
                     "alignment_dwell_seconds": self.config.alignment_dwell_seconds,
+                    "compass_pulse_enabled": self.config.compass_pulse_enabled,
+                    "compass_pulse_settle_seconds": self.config.compass_pulse_settle_seconds,
+                    "compass_pulse_hold_candidates_seconds": self.config.compass_pulse_hold_candidates_seconds,
                     "final_reticle_enabled": self.config.final_reticle_enabled,
                     "final_reticle_track_anywhere": self.config.final_reticle_track_anywhere,
                     "final_reticle_alignment_tolerance_px": self.config.final_reticle_alignment_tolerance_px,
@@ -1345,6 +1575,7 @@ class AlignToTargetCompass:
         }
         steering = _SteeringState(input_adapter)
         consensus_state = _NearCenterConsensusState()
+        compass_pulse_state = _create_compass_pulse_controller_state(self.config)
         final_reticle_state = _FinalReticleState()
         final_phase_state = _create_final_phase_controller_state(self.config)
         telemetry = _LoopTelemetry()
@@ -1365,6 +1596,25 @@ class AlignToTargetCompass:
 
         try:
             while deadline is None or time.monotonic() < deadline:
+                wait_now = time.monotonic()
+                compass_wait_update, compass_measurement_ready = _advance_compass_pulse_wait_state(
+                    state=compass_pulse_state,
+                    steering=steering,
+                    now=wait_now,
+                    config=self.config,
+                )
+                if _transition_has_motion_input(compass_wait_update):
+                    last_motion_input_at = wait_now
+                compass_wait_deadline = _compass_pulse_wait_deadline(compass_pulse_state)
+                if (
+                    self.config.compass_pulse_enabled
+                    and compass_pulse_state.is_waiting
+                    and not compass_measurement_ready
+                    and compass_wait_deadline is not None
+                ):
+                    time.sleep(min(0.01, max(0.0, compass_wait_deadline - wait_now)))
+                    continue
+
                 try:
                     frame = self._capture_frame(capture, capture_region)
                 except RuntimeError as exc:
@@ -1389,7 +1639,9 @@ class AlignToTargetCompass:
 
                 if not read_result.is_detected or marker is None:
                     last_debug.pop("final_phase", None)
+                    last_debug.pop("compass_phase", None)
                     consensus_state.reset()
+                    compass_pulse_state.reset(self.config, reset_models=False)
                     final_reticle_state.reset()
                     final_phase_state.reset(self.config)
                     last_debug.pop("final_reticle", None)
@@ -1454,6 +1706,22 @@ class AlignToTargetCompass:
                     last_debug.pop("debug_snapshot", None)
                     last_debug.pop("debug_sources", None)
                     last_debug.update(marker.to_debug_dict())
+                    if self.config.compass_pulse_enabled and compass_pulse_state.mode == "settling":
+                        if compass_pulse_state.active_episode is not None:
+                            observed_gain = _update_compass_pulse_model_from_episode(
+                                state=compass_pulse_state,
+                                episode=compass_pulse_state.active_episode,
+                                marker=marker,
+                                config=self.config,
+                            )
+                            last_debug["compass_phase"] = {
+                                "mode": "measurement_update",
+                                "observed_gain_px_per_second": round(observed_gain, 3),
+                                "models": _compass_pulse_models_to_debug(compass_pulse_state),
+                            }
+                        compass_pulse_state.active_episode = None
+                        compass_pulse_state.settle_until = None
+                        compass_pulse_state.mode = "choose_pulse"
                     active_before_update = steering.active_keys()
                     _update_runtime_dynamics_profile(
                         dynamics_profiles["pitch"],
@@ -1476,6 +1744,8 @@ class AlignToTargetCompass:
                     last_debug.pop("final_reticle", None)
                     final_phase_active = final_phase_state.is_active
                     final_reticle_centered_ready = _is_final_reticle_handoff_ready(marker, self.config)
+                    reticle_locked = final_reticle_state.engaged or final_phase_active
+                    reticle_tracking_ready = final_reticle_centered_ready or reticle_locked
                     stationary_seconds = max(0.0, now - last_motion_input_at)
                     active_keys_before_reticle = steering.active_keys()
                     final_reticle_stationary_ready = (
@@ -1499,9 +1769,13 @@ class AlignToTargetCompass:
                             self.config,
                         )
                         reticle_debug["tracking_mode"] = (
-                            "handoff_near_center"
-                            if final_reticle_centered_ready
-                            else ("anywhere" if self.config.final_reticle_track_anywhere else "near_center_only")
+                            "reticle_locked"
+                            if reticle_locked
+                            else (
+                                "handoff_near_center"
+                                if final_reticle_centered_ready
+                                else ("anywhere" if self.config.final_reticle_track_anywhere else "near_center_only")
+                            )
                         )
                         reticle_debug["centered_ready"] = final_reticle_centered_ready
                         reticle_debug["stationary_ready"] = final_reticle_stationary_ready
@@ -1512,11 +1786,11 @@ class AlignToTargetCompass:
                         reticle_detected = (
                             candidate_reticle_dx is not None
                             and candidate_reticle_dy is not None
-                            and final_reticle_centered_ready
+                            and reticle_tracking_ready
                         )
                         final_reticle_state.update(
                             detected=reticle_detected,
-                            centered_ready=final_reticle_centered_ready,
+                            centered_ready=reticle_tracking_ready,
                             now=now,
                             required_detections=self.config.final_reticle_required_consecutive_detections,
                             max_misses=self.config.final_reticle_max_consecutive_misses,
@@ -1527,7 +1801,8 @@ class AlignToTargetCompass:
                             else max(0.0, now - final_reticle_state.centered_missing_started_at)
                         )
                         reticle_missing_compass_fallback_ready = (
-                            final_reticle_centered_ready
+                            not reticle_locked
+                            and final_reticle_centered_ready
                             and not reticle_detected
                             and centered_missing_elapsed_seconds is not None
                             and centered_missing_elapsed_seconds >= self.config.final_reticle_missing_compass_fallback_seconds
@@ -1543,7 +1818,7 @@ class AlignToTargetCompass:
                             else round(centered_missing_elapsed_seconds, 3)
                         )
                         reticle_debug["compass_fallback_ready"] = reticle_missing_compass_fallback_ready
-                        if not final_reticle_centered_ready:
+                        if not reticle_locked and not final_reticle_centered_ready:
                             reticle_debug["handoff_blocker"] = "compass_not_centered"
                         elif reticle_missing_compass_fallback_ready:
                             reticle_debug["handoff_blocker"] = "reticle_missing_fallback_to_compass"
@@ -1585,6 +1860,7 @@ class AlignToTargetCompass:
                     )
 
                     if final_phase_state.is_active:
+                        compass_pulse_state.reset(self.config, reset_models=False)
                         consensus_state.reset()
                         dwell_started_at = None
                         _reset_controller_states(controller_states)
@@ -1911,6 +2187,7 @@ class AlignToTargetCompass:
                                         if _transition_has_motion_input(axis_update):
                                             last_motion_input_at = now
                     elif in_consensus_zone:
+                        compass_pulse_state.reset(self.config, reset_models=False)
                         if steering.release_all(now):
                             last_motion_input_at = now
                         _reset_controller_states(controller_states)
@@ -2010,18 +2287,13 @@ class AlignToTargetCompass:
                         hold_alignment = (
                             marker.is_filled and marker.distance <= dwell_release_distance
                         )
-                        fallback_hold_alignment = reticle_missing_compass_fallback_ready and hold_alignment
-
-                        allow_compass_success = (
-                            (not self.config.final_reticle_enabled)
-                            or reticle_missing_compass_fallback_ready
-                        )
+                        allow_compass_success = not self.config.final_reticle_enabled
 
                         if allow_compass_success and (
                             marker.is_aligned(self.config)
-                            or fallback_hold_alignment
                             or (dwell_started_at is not None and hold_alignment)
                         ):
+                            compass_pulse_state.reset(self.config, reset_models=False)
                             if dwell_started_at is None:
                                 dwell_started_at = now
                             dwell_elapsed = now - dwell_started_at
@@ -2036,28 +2308,116 @@ class AlignToTargetCompass:
                             if dwell_started_at is not None:
                                 anomaly_reason = "dwell_exit"
                             dwell_started_at = None
-
-                            if marker.is_hollow and marker.distance <= self.config.center_tolerance_px:
-                                controller_outputs["pitch"] = {
-                                    "axis": "pitch",
-                                    "mode": "breakout",
-                                    "error_px": marker.control_dy,
-                                    "derivative": 0.0,
-                                    "output": -1.0,
-                                    "gain_scale": 1.0,
-                                    "profile_px_per_second": dynamics_profiles["pitch"].px_per_second,
+                            if self.config.compass_pulse_enabled:
+                                _reset_controller_states(controller_states)
+                                smart_nudge_states["pitch"].last_command_sign = 0
+                                smart_nudge_states["yaw"].last_command_sign = 0
+                                choice = _choose_compass_pulse_action(
+                                    marker=marker,
+                                    state=compass_pulse_state,
+                                    context=context,
+                                    config=self.config,
+                                )
+                                last_debug["compass_phase"] = {
+                                    "mode": "choose_pulse",
+                                    "models": _compass_pulse_models_to_debug(compass_pulse_state),
+                                    "selected_action": {
+                                        "direction": choice["direction"],
+                                        "axis": choice["axis"],
+                                        "hold_seconds": round(choice["hold_seconds"], 3),
+                                        "predicted_residual_px": round(choice["predicted_residual_px"], 3),
+                                        "score": round(choice["score"], 3),
+                                        "overshoot_rejected": choice["overshoot_rejected"],
+                                        "reason": choice["reason"],
+                                    },
                                 }
-                                controller_outputs["yaw"] = {
-                                    "axis": "yaw",
-                                    "mode": "breakout",
-                                    "error_px": marker.control_dx,
-                                    "derivative": 0.0,
-                                    "output": 0.0,
-                                    "gain_scale": 1.0,
-                                    "profile_px_per_second": dynamics_profiles["yaw"].px_per_second,
-                                }
-                                controller_states["pitch"].previous_output = -1.0
-                                controller_states["yaw"].previous_output = 0.0
+                                if choice["direction"] == "noop":
+                                    if steering.release_all(now):
+                                        last_motion_input_at = now
+                                    controller_outputs["pitch"] = {
+                                        "axis": "pitch",
+                                        "mode": "compass_pulse_aligned",
+                                        "error_px": marker.control_dy,
+                                        "derivative": 0.0,
+                                        "output": 0.0,
+                                        "gain_scale": 1.0,
+                                        "profile_px_per_second": dynamics_profiles["pitch"].px_per_second,
+                                    }
+                                    controller_outputs["yaw"] = {
+                                        "axis": "yaw",
+                                        "mode": "compass_pulse_aligned",
+                                        "error_px": marker.control_dx,
+                                        "derivative": 0.0,
+                                        "output": 0.0,
+                                        "gain_scale": 1.0,
+                                        "profile_px_per_second": dynamics_profiles["yaw"].px_per_second,
+                                    }
+                                    last_debug["axis_transitions"] = {
+                                        "pitch": {"axis": "pitch", "active_key": None, "desired_key": None, "transition": None},
+                                        "yaw": {"axis": "yaw", "active_key": None, "desired_key": None, "transition": None},
+                                    }
+                                else:
+                                    axis_error_px = marker.control_dy if choice["axis"] == "pitch" else marker.control_dx
+                                    axis_update = steering.start_axis_pulse(
+                                        choice["axis"],
+                                        key=choice["key"],
+                                        hold_seconds=choice["hold_seconds"],
+                                        now=now,
+                                    )
+                                    compass_pulse_state.active_episode = _FinalPhaseEpisode(
+                                        direction=choice["direction"],
+                                        axis=choice["axis"],
+                                        key=choice["key"],
+                                        hold_seconds=choice["hold_seconds"],
+                                        commanded_error_px=axis_error_px,
+                                        predicted_residual_px=choice["predicted_residual_px"],
+                                        started_at=now,
+                                        pulse_end_at=now + choice["hold_seconds"],
+                                        settle_until=(now + choice["hold_seconds"] + self.config.compass_pulse_settle_seconds),
+                                    )
+                                    compass_pulse_state.mode = "pulse_active"
+                                    compass_pulse_state.settle_until = None
+                                    last_debug["compass_phase"]["mode"] = "pulse_active"
+                                    last_debug["compass_phase"]["episode"] = {
+                                        "direction": choice["direction"],
+                                        "axis": choice["axis"],
+                                        "hold_seconds": round(choice["hold_seconds"], 3),
+                                        "commanded_error_px": round(axis_error_px, 3),
+                                        "predicted_residual_px": round(choice["predicted_residual_px"], 3),
+                                    }
+                                    last_debug["axis_transitions"] = {
+                                        "pitch": {"axis": "pitch", "active_key": None, "desired_key": None, "transition": None},
+                                        "yaw": {"axis": "yaw", "active_key": None, "desired_key": None, "transition": None},
+                                    }
+                                    last_debug["axis_transitions"][choice["axis"]] = axis_update
+                                    controller_outputs["pitch"] = {
+                                        "axis": "pitch",
+                                        "mode": "compass_pulse_active" if choice["axis"] == "pitch" else "compass_pulse_idle",
+                                        "error_px": marker.control_dy,
+                                        "derivative": 0.0,
+                                        "output": (
+                                            _final_phase_direction_output(choice["direction"])
+                                            if choice["axis"] == "pitch"
+                                            else 0.0
+                                        ),
+                                        "gain_scale": 1.0,
+                                        "profile_px_per_second": dynamics_profiles["pitch"].px_per_second,
+                                    }
+                                    controller_outputs["yaw"] = {
+                                        "axis": "yaw",
+                                        "mode": "compass_pulse_active" if choice["axis"] == "yaw" else "compass_pulse_idle",
+                                        "error_px": marker.control_dx,
+                                        "derivative": 0.0,
+                                        "output": (
+                                            _final_phase_direction_output(choice["direction"])
+                                            if choice["axis"] == "yaw"
+                                            else 0.0
+                                        ),
+                                        "gain_scale": 1.0,
+                                        "profile_px_per_second": dynamics_profiles["yaw"].px_per_second,
+                                    }
+                                    if _transition_has_motion_input(axis_update):
+                                        last_motion_input_at = now
                             else:
                                 controller_outputs = _controller_output_for_marker(
                                     marker,
@@ -2071,131 +2431,6 @@ class AlignToTargetCompass:
                                     controller_outputs=controller_outputs,
                                     config=self.config,
                                 )
-                                pitch_oscillation = _track_axis_oscillation(
-                                    controller_states["pitch"],
-                                    marker.control_dy,
-                                    now,
-                                    self.config,
-                                )
-                                yaw_oscillation = _track_axis_oscillation(
-                                    controller_states["yaw"],
-                                    marker.control_dx,
-                                    now,
-                                    self.config,
-                                )
-                                if pitch_oscillation or yaw_oscillation:
-                                    anomaly_reason = "oscillation"
-                            use_filled_pwm = (
-                                marker.is_filled
-                                and marker.distance <= self.config.filled_pwm_start_distance_px
-                            )
-                            if use_filled_pwm:
-                                controller_outputs["pitch"]["mode"] = "filled_pwm"
-                                controller_outputs["yaw"]["mode"] = "filled_pwm"
-                                pitch_hold_seconds, pitch_release_seconds, pitch_predicted_hold, pitch_overshot = _compute_filled_pwm_timing(
-                                    axis="pitch",
-                                    axis_error_px=marker.control_dy,
-                                    marker_distance_px=marker.distance,
-                                    loop_fps=telemetry.loop_fps,
-                                    capture_fps=telemetry.capture_fps,
-                                    dynamics_profile=dynamics_profiles["pitch"],
-                                    smart_nudge_state=smart_nudge_states["pitch"],
-                                    config=self.config,
-                                )
-                                yaw_hold_seconds, yaw_release_seconds, yaw_predicted_hold, yaw_overshot = _compute_filled_pwm_timing(
-                                    axis="yaw",
-                                    axis_error_px=marker.control_dx,
-                                    marker_distance_px=marker.distance,
-                                    loop_fps=telemetry.loop_fps,
-                                    capture_fps=telemetry.capture_fps,
-                                    dynamics_profile=dynamics_profiles["yaw"],
-                                    smart_nudge_state=smart_nudge_states["yaw"],
-                                    config=self.config,
-                                )
-                                controller_outputs["pitch"]["hold_seconds"] = pitch_hold_seconds
-                                controller_outputs["pitch"]["release_seconds"] = pitch_release_seconds
-                                controller_outputs["pitch"]["predicted_hold_seconds"] = pitch_predicted_hold
-                                controller_outputs["pitch"]["overshot"] = pitch_overshot
-                                controller_outputs["yaw"]["hold_seconds"] = yaw_hold_seconds
-                                controller_outputs["yaw"]["release_seconds"] = yaw_release_seconds
-                                controller_outputs["yaw"]["predicted_hold_seconds"] = yaw_predicted_hold
-                                controller_outputs["yaw"]["overshot"] = yaw_overshot
-                                pitch_output = (
-                                    _conservative_pwm_output(
-                                        axis_error_px=marker.control_dy,
-                                        deadband_px=self.config.filled_pwm_deadband_px,
-                                        output_max=self.config.filled_pwm_output_max,
-                                        engage_threshold=self.config.pitch_engage_threshold,
-                                    )
-                                    if pitch_hold_seconds > 0.0
-                                    else 0.0
-                                )
-                                yaw_output = (
-                                    _conservative_pwm_output(
-                                        axis_error_px=marker.control_dx,
-                                        deadband_px=self.config.filled_pwm_deadband_px,
-                                        output_max=self.config.filled_pwm_output_max,
-                                        engage_threshold=self.config.yaw_engage_threshold,
-                                    )
-                                    if yaw_hold_seconds > 0.0
-                                    else 0.0
-                                )
-
-                                if marker.distance <= self.config.filled_pwm_single_axis_distance_px:
-                                    if abs(marker.control_dy) >= abs(marker.control_dx):
-                                        yaw_output = 0.0
-                                        yaw_hold_seconds = 0.0
-                                        yaw_release_seconds = max(
-                                            yaw_release_seconds,
-                                            _expected_frame_seconds(telemetry.loop_fps, telemetry.capture_fps, self.config),
-                                        )
-                                        controller_outputs["yaw"]["single_axis_suppressed"] = True
-                                    else:
-                                        pitch_output = 0.0
-                                        pitch_hold_seconds = 0.0
-                                        pitch_release_seconds = max(
-                                            pitch_release_seconds,
-                                            _expected_frame_seconds(telemetry.loop_fps, telemetry.capture_fps, self.config),
-                                        )
-                                        controller_outputs["pitch"]["single_axis_suppressed"] = True
-
-                                controller_outputs["pitch"]["output"] = pitch_output
-                                controller_outputs["yaw"]["output"] = yaw_output
-                                controller_outputs["pitch"]["hold_seconds"] = pitch_hold_seconds
-                                controller_outputs["pitch"]["release_seconds"] = pitch_release_seconds
-                                controller_outputs["yaw"]["hold_seconds"] = yaw_hold_seconds
-                                controller_outputs["yaw"]["release_seconds"] = yaw_release_seconds
-                                pitch_update = steering.nudge_axis(
-                                    axis="pitch",
-                                    output=pitch_output,
-                                    positive_key=context.config.controls.pitch_down,
-                                    negative_key=context.config.controls.pitch_up,
-                                    engage_threshold=self.config.pitch_engage_threshold,
-                                    release_threshold=self.config.pitch_release_threshold,
-                                    hold_seconds=pitch_hold_seconds,
-                                    release_seconds=pitch_release_seconds,
-                                    now=now,
-                                )
-                                yaw_update = steering.nudge_axis(
-                                    axis="yaw",
-                                    output=yaw_output,
-                                    positive_key=context.config.controls.yaw_right,
-                                    negative_key=context.config.controls.yaw_left,
-                                    engage_threshold=self.config.yaw_engage_threshold,
-                                    release_threshold=self.config.yaw_release_threshold,
-                                    hold_seconds=yaw_hold_seconds,
-                                    release_seconds=yaw_release_seconds,
-                                    now=now,
-                                )
-                                if "press:" in (pitch_update.get("transition") or ""):
-                                    smart_nudge_states["pitch"].record_command(marker.control_dy)
-                                elif pitch_output == 0.0:
-                                    smart_nudge_states["pitch"].last_command_sign = 0
-                                if "press:" in (yaw_update.get("transition") or ""):
-                                    smart_nudge_states["yaw"].record_command(marker.control_dx)
-                                elif yaw_output == 0.0:
-                                    smart_nudge_states["yaw"].last_command_sign = 0
-                            else:
                                 pitch_update = steering.update_axis(
                                     axis="pitch",
                                     output=controller_outputs["pitch"]["output"],
@@ -2216,9 +2451,9 @@ class AlignToTargetCompass:
                                     now=now,
                                     config=self.config,
                                 )
-                            last_debug["axis_transitions"] = {"pitch": pitch_update, "yaw": yaw_update}
-                            if _transition_has_motion_input(pitch_update) or _transition_has_motion_input(yaw_update):
-                                last_motion_input_at = now
+                                last_debug["axis_transitions"] = {"pitch": pitch_update, "yaw": yaw_update}
+                                if _transition_has_motion_input(pitch_update) or _transition_has_motion_input(yaw_update):
+                                    last_motion_input_at = now
 
                 dwell_elapsed = 0.0 if dwell_started_at is None else max(0.0, now - dwell_started_at)
                 active_keys = steering.active_keys()
@@ -2319,6 +2554,9 @@ class AlignToTargetCompass:
                     compact_final_phase = _compact_final_phase_for_loop_log(last_debug.get("final_phase"))
                     if compact_final_phase is not None:
                         loop_extra["final_phase"] = compact_final_phase
+                    compact_compass_phase = _compact_compass_phase_for_loop_log(last_debug.get("compass_phase"))
+                    if compact_compass_phase is not None:
+                        loop_extra["compass_phase"] = compact_compass_phase
                     if "missing_elapsed_seconds" in last_debug:
                         loop_extra["missing_elapsed_seconds"] = last_debug["missing_elapsed_seconds"]
                     if "near_center_consensus" in last_debug:
@@ -2547,12 +2785,19 @@ def _save_debug_capture_bundle(
         search_radius=max(96, int(config.final_reticle_search_radius_px)),
     )
     reticle_crop = _extract_region(frame, reticle_region)
+    reticle_tracker_config = ReticleTrackerConfig(
+        search_radius_px=max(96, int(config.final_reticle_search_radius_px)),
+        capture_target_fps=max(1, int(config.control_target_fps)),
+        show_mask_window=False,
+    )
+    _, reticle_overlay, _ = detect_center_reticle(frame, reticle_tracker_config)
 
     return {
         "debug": write_image("debug", debug_image),
         "full": write_image("full", frame),
         "compass_roi": write_image("compass_roi", compass_roi),
         "reticle_roi": write_image("reticle_roi", reticle_crop),
+        "reticle_debug": write_image("reticle_debug", reticle_overlay),
     }
 
 

@@ -19,12 +19,15 @@ from app.actions.align import (
     CompassReadResult,
     _AxisControllerState,
     _SteeringState,
+    _choose_compass_pulse_action,
     _choose_final_phase_action,
     _compute_axis_controller_output,
+    _create_compass_pulse_controller_state,
     _create_final_phase_controller_state,
     _desired_key_for_output,
     _detect_final_reticle,
     _slew_limit,
+    _update_compass_pulse_model_from_episode,
     _update_final_phase_model_from_episode,
     detect_compass_marker,
 )
@@ -1046,7 +1049,7 @@ class TestAlignAction(unittest.TestCase):
             or ("key_down", context.config.controls.pitch_down) in timeline
         )
 
-    def test_final_reticle_missing_falls_back_to_compass_success(self) -> None:
+    def test_final_reticle_missing_does_not_finish_on_compass(self) -> None:
         timeline: list[tuple[str, object]] = []
         frame = load_fixture("compass_filled_centered.png")
         config = AlignConfig(
@@ -1075,11 +1078,14 @@ class TestAlignAction(unittest.TestCase):
             ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.05)):
                 result = AlignToTargetCompass(config=config).run(context)
 
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
         self.assertEqual(input_adapter.active_keys, set())
         assert result.debug is not None
         self.assertIn("final_reticle", result.debug)
-        self.assertEqual(result.debug["final_reticle"]["handoff_blocker"], "reticle_missing_fallback_to_compass")
+        self.assertIn(
+            result.debug["final_reticle"]["handoff_blocker"],
+            {"reticle_not_detected", "reticle_missing_fallback_to_compass"},
+        )
 
     def test_filled_near_center_uses_pwm_pulses_before_dwell(self) -> None:
         timeline: list[tuple[str, object]] = []
@@ -1152,6 +1158,51 @@ class TestAlignAction(unittest.TestCase):
         self.assertIn("final_phase", result.debug)
         self.assertGreaterEqual(result.debug["final_phase"]["confirmation_elapsed_seconds"], config.final_phase_confirm_seconds)
 
+    def test_final_phase_ignores_compass_noise_after_reticle_engages(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(
+            near_center_consensus_enabled=False,
+            final_reticle_enabled=True,
+            final_reticle_stationary_seconds=0.0,
+            final_reticle_required_consecutive_detections=1,
+            final_phase_confirm_seconds=0.6,
+            timeout_seconds=1.3,
+        )
+        centered_reticle = (
+            ReticleDetection(
+                found=True,
+                center_x=frame.shape[1] / 2.0,
+                center_y=frame.shape[0] / 2.0,
+                outer_radius_px=41.0,
+                score=2.0,
+                search_region=(700, 280, 520, 520),
+                metrics={"score": 2.0},
+            ),
+            np.zeros((1, 1, 3), dtype=np.uint8),
+            np.zeros((1, 1), dtype=np.uint8),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, input_adapter, _ = build_context([frame] * 16, timeline, Path(temp_dir))
+            reads = itertools.chain(
+                [make_marker("filled", dx=0.0, dy=0.0, config=config)],
+                itertools.repeat(make_marker("filled", dx=18.0, dy=-14.0, config=config)),
+            )
+
+            with patch("app.actions.align.detect_compass_marker", side_effect=reads), patch(
+                "app.actions.align.detect_center_reticle", return_value=centered_reticle
+            ), patch("app.actions.align.time.monotonic", side_effect=FakeMonotonic(step=0.1)):
+                result = AlignToTargetCompass(config=config).run(context)
+
+        self.assertTrue(result.success)
+        self.assertEqual(input_adapter.active_keys, set())
+        assert result.debug is not None
+        self.assertIn("final_reticle", result.debug)
+        self.assertEqual(result.debug["final_reticle"]["tracking_mode"], "reticle_locked")
+        self.assertIn("final_phase", result.debug)
+        self.assertGreaterEqual(result.debug["final_phase"]["confirmation_elapsed_seconds"], config.final_phase_confirm_seconds)
+
     def test_final_phase_model_update_changes_later_pulse_selection(self) -> None:
         timeline: list[tuple[str, object]] = []
         frame = load_fixture("compass_filled_centered.png")
@@ -1221,6 +1272,78 @@ class TestAlignAction(unittest.TestCase):
                 episode=episode,
                 control_dx=6.0,
                 control_dy=0.0,
+                config=config,
+            )
+
+        self.assertAlmostEqual(observed_gain, 100.0, places=3)
+
+    def test_compass_pulse_model_update_changes_later_pulse_selection(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(compass_pulse_model_ema_alpha=1.0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, _, _ = build_context([frame], timeline, Path(temp_dir))
+            state = _create_compass_pulse_controller_state(config)
+            marker = make_marker("filled", dx=24.0, dy=0.0, config=config).marker
+            assert marker is not None
+
+            initial_choice = _choose_compass_pulse_action(
+                marker=marker,
+                state=state,
+                context=context,
+                config=config,
+            )
+            episode = _FinalPhaseEpisode(
+                direction="yaw_right",
+                axis="yaw",
+                key=context.config.controls.yaw_right,
+                hold_seconds=0.18,
+                commanded_error_px=24.0,
+                predicted_residual_px=0.0,
+                started_at=0.0,
+                pulse_end_at=0.18,
+                settle_until=1.68,
+            )
+            observed_gain = _update_compass_pulse_model_from_episode(
+                state=state,
+                episode=episode,
+                marker=make_marker("filled", dx=6.0, dy=0.0, config=config).marker,
+                config=config,
+            )
+            updated_choice = _choose_compass_pulse_action(
+                marker=marker,
+                state=state,
+                context=context,
+                config=config,
+            )
+
+        self.assertGreater(observed_gain, config.compass_pulse_yaw_prior_px_per_second)
+        self.assertLess(updated_choice["hold_seconds"], initial_choice["hold_seconds"])
+
+    def test_compass_pulse_model_update_uses_actual_hold_duration_when_available(self) -> None:
+        timeline: list[tuple[str, object]] = []
+        frame = load_fixture("compass_filled_centered.png")
+        config = AlignConfig(compass_pulse_model_ema_alpha=1.0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            context, _, _ = build_context([frame], timeline, Path(temp_dir))
+            state = _create_compass_pulse_controller_state(config)
+
+            episode = _FinalPhaseEpisode(
+                direction="yaw_right",
+                axis="yaw",
+                key=context.config.controls.yaw_right,
+                hold_seconds=0.09,
+                commanded_error_px=24.0,
+                predicted_residual_px=0.0,
+                started_at=0.0,
+                pulse_end_at=0.09,
+                settle_until=1.59,
+                actual_hold_seconds=0.18,
+            )
+            observed_gain = _update_compass_pulse_model_from_episode(
+                state=state,
+                episode=episode,
+                marker=make_marker("filled", dx=6.0, dy=0.0, config=config).marker,
                 config=config,
             )
 

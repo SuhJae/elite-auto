@@ -93,6 +93,7 @@ def build_state(*, gui_focus: int | None) -> ShipState:
         cargo_count=0,
         gui_focus=gui_focus,
         status_flags=0,
+        raw_status={"GuiFocus": gui_focus} if gui_focus is not None else {},
     )
 
 
@@ -133,10 +134,7 @@ class TestNavigation(unittest.TestCase):
         ).run(context)
 
         self.assertTrue(result.success)
-        self.assertEqual(
-            input_adapter.calls,
-            [("hold", "up", 0.0)],
-        )
+        self.assertEqual(input_adapter.calls, [("hold", "up", 0.0)])
         self.assertEqual(
             ship_control.calls,
             [
