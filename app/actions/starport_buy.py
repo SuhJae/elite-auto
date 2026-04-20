@@ -17,6 +17,7 @@ from app.config import AppConfig, configure_logging
 from app.domain.context import Context
 from app.domain.protocols import MarketDataSource
 from app.domain.result import Result
+from app.actions.starport_sell import _resolve_elite_path, load_cargo_inventory
 from app.state.bindings_reader import EliteBindingsReader
 from app.state.cargo_reader import CargoReader
 from app.state.journal_tailer import JournalTailer
@@ -88,12 +89,16 @@ class BuyFromStarport:
             },
         )
 
-        self._open_station_services_and_market(context)
-        snapshot = self.market_data_source.snapshot(required=True)
-
         commodity_name = _normalize_commodity_name(self.commodity)
         if not commodity_name:
             return Result.fail("A commodity name is required.", debug={"commodity": self.commodity})
+
+        cargo_path = _resolve_elite_path(context.config.paths.cargo_file, "Cargo.json")
+        cargo_inventory_before = load_cargo_inventory(cargo_path)
+        cargo_units_before = cargo_inventory_before.get(commodity_name, 0)
+
+        self._open_station_services_and_market(context)
+        snapshot = self.market_data_source.snapshot(required=True)
 
         visible_items = get_buy_screen_items(snapshot)
         matching_item = next(
@@ -175,6 +180,21 @@ class BuyFromStarport:
 
         self._buy_one_visible_item(context, list_index)
 
+        cargo_inventory_after = load_cargo_inventory(cargo_path)
+        cargo_units_after = cargo_inventory_after.get(commodity_name, 0)
+        cargo_units_bought = cargo_units_after - cargo_units_before
+        if cargo_units_bought <= 0:
+            return Result.fail(
+                "Buy did not increase cargo; stopping for safety.",
+                debug={
+                    "station_name": snapshot.station_name,
+                    "commodity": self.commodity,
+                    "cargo_units_before": cargo_units_before,
+                    "cargo_units_after": cargo_units_after,
+                    "cargo_path": str(cargo_path),
+                },
+            )
+
         return Result.ok(
             "Starport buy routine completed.",
             debug={
@@ -183,6 +203,10 @@ class BuyFromStarport:
                 "requested": self.commodity,
                 "max_buy_price": self.max_buy_price,
                 "unit_buy_price": matching_item.buy_price if matching_item is not None else None,
+                "supply_before": matching_item.stock if matching_item is not None else None,
+                "cargo_units_before": cargo_units_before,
+                "cargo_units_after": cargo_units_after,
+                "cargo_units_bought": cargo_units_bought,
             },
         )
 

@@ -140,6 +140,15 @@ class SellFromStarport:
                 return validation_result
 
         visible_items = get_sell_screen_items(snapshot)
+        matching_item = next(
+            (
+                commodity
+                for commodity in visible_items
+                if _normalize_commodity_name(_goods_name(commodity)) == commodity_name
+                or _normalize_commodity_name(commodity.name_localised or "") == commodity_name
+            ),
+            None,
+        )
         visible_names = {
             _normalize_commodity_name(_goods_name(commodity))
             for commodity in visible_items
@@ -186,6 +195,17 @@ class SellFromStarport:
                     "cargo_path": str(cargo_path),
                 },
             )
+        if cargo_units_after > 0:
+            return Result.fail(
+                "Sell did not empty cargo; stopping for safety.",
+                debug={
+                    "station_name": snapshot.station_name,
+                    "commodity": self.commodity,
+                    "cargo_units_before": cargo_units_before,
+                    "cargo_units_after": cargo_units_after,
+                    "cargo_path": str(cargo_path),
+                },
+            )
 
         return Result.ok(
             "Starport sell routine completed.",
@@ -195,6 +215,8 @@ class SellFromStarport:
                 "requested": self.commodity,
                 "cargo_units_before": cargo_units_before,
                 "cargo_units_after": cargo_units_after,
+                "cargo_units_sold": cargo_units_before - cargo_units_after,
+                "demand_before": matching_item.demand if matching_item is not None else None,
             },
         )
 

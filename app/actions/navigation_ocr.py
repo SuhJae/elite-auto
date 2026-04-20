@@ -30,7 +30,7 @@ from app.domain.result import Result
 STANDALONE_CONFIG_PATH: str | None = None
 # STANDALONE_TARGET_NAME = "TOGETHER AN OCEAN Y8M-8XZ"
 # STANDALONE_TARGET_NAME = "ORBITAL CONSTRUCTION SITE: PARISE GATEWAY"
-STANDALONE_TARGET_NAME = "HILDEBRANDT REFINERY"
+STANDALONE_TARGET_NAME = "SITE-43"
 # STANDALONE_TARGET_NAME = "SYNUEFAI QT-O D7-70"
 STANDALONE_WINDOW_TITLE = "Elite Dangerous"
 STANDALONE_START_DELAY_SECONDS = 3.0
@@ -116,6 +116,7 @@ class MoveCursorToNavTarget:
     """Use OCR/debug capture to move the nav cursor onto a named target."""
 
     target_name: str
+    target_names: list[str] | None = None
     timings: OcrNavTimings = field(default_factory=OcrNavTimings)
     config: OcrNavConfig = field(default_factory=OcrNavConfig)
 
@@ -135,9 +136,17 @@ class MoveCursorToNavTarget:
                 debug={"gui_focus": state.gui_focus, "expected_gui_focus": LEFT_PANEL_GUI_FOCUS},
             )
 
-        target_key = _normalize_nav_text(self.target_name)
-        if not target_key:
-            return Result.fail("A target name is required.", debug={"target_name": self.target_name})
+        target_names = self.target_names if self.target_names else [self.target_name]
+        normalized_targets = [
+            (name, _normalize_nav_text(name))
+            for name in target_names
+            if _normalize_nav_text(name)
+        ]
+        if not normalized_targets:
+            return Result.fail(
+                "At least one target name is required.",
+                debug={"target_name": self.target_name, "target_names": self.target_names},
+            )
 
         tesseract_path = _find_tesseract(self.config.tesseract_path)
         if tesseract_path is None:
@@ -153,6 +162,7 @@ class MoveCursorToNavTarget:
             "Starting navigation OCR scan",
             extra={
                 "target_name": self.target_name,
+                "target_names": [name for name, _ in normalized_targets],
                 "tesseract_path": tesseract_path,
                 "window_title_substring": self.config.window_title_substring,
                 "list_region_fractions": self.config.list_region_fractions,
@@ -229,9 +239,14 @@ class MoveCursorToNavTarget:
                 save_debug_artifacts=self.config.save_debug_artifacts,
             )
             visible_texts = [line.text for line in lines]
-            target_match = _find_best_target_match(lines, target_key, self.config.match_threshold) if lines else None
-            target_order_index = target_match[0] if target_match is not None else None
-            target_line = target_match[1] if target_match is not None else None
+            target_match = (
+                _find_best_target_match_for_any(lines, normalized_targets, self.config.match_threshold)
+                if lines
+                else None
+            )
+            matched_target_name = target_match[0] if target_match is not None else None
+            target_order_index = target_match[1] if target_match is not None else None
+            target_line = target_match[2] if target_match is not None else None
             target_index = _resolve_target_row_index(
                 page_index=page_index,
                 target_order_index=target_order_index,
@@ -258,6 +273,7 @@ class MoveCursorToNavTarget:
                     "target_index": target_index,
                     "expected_visible_rows": self.config.expected_visible_rows,
                     "best_match": best_match,
+                    "matched_target_name": matched_target_name,
                     "overlap_match": overlap_match,
                     "debug_artifacts": debug_artifacts,
                 },
@@ -282,6 +298,7 @@ class MoveCursorToNavTarget:
                     "move_direction": move_direction,
                     "move_count": move_count,
                     "best_match": best_match,
+                    "matched_target_name": matched_target_name,
                 },
             )
 
@@ -299,6 +316,7 @@ class MoveCursorToNavTarget:
                     "target_index": target_index,
                     "effective_cursor_index": effective_cursor_index,
                     "best_match": best_match,
+                    "matched_target_name": matched_target_name,
                     "overlap_match": overlap_match,
                     "move_direction": move_direction,
                     "move_count": move_count,
@@ -308,7 +326,11 @@ class MoveCursorToNavTarget:
 
         return Result.fail(
             "Navigation OCR scan did not find the target within the scan limit.",
-            debug={"target_name": self.target_name, "max_scan_pages": self.config.max_scan_pages},
+            debug={
+                "target_name": self.target_name,
+                "target_names": [name for name, _ in normalized_targets],
+                "max_scan_pages": self.config.max_scan_pages,
+            },
         )
 
 
@@ -453,7 +475,7 @@ def _resolve_list_quad_points(
     scrolled_quad_points: tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None,
 ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]] | None:
     if page_index <= 0:
-        return _translate_quad_points(first_page_quad_points, offset_x=0, offset_y=-8)
+        return _translate_quad_points(first_page_quad_points, offset_x=0, offset_y=22)
     return scrolled_quad_points or first_page_quad_points
 
 
@@ -1198,9 +1220,31 @@ def _find_best_target_match(lines: list[OcrLine], target_key: str, match_thresho
     best_score, _best_confidence, best_index, best_line = ranked_matches[0]
     if len(ranked_matches) > 1:
         runner_up_score = ranked_matches[1][0]
-        if best_score - runner_up_score < 0.025:
+        if best_score - runner_up_score < 0.015:
             return None
     return best_index, best_line
+
+
+def _find_best_target_match_for_any(
+    lines: list[OcrLine],
+    normalized_targets: list[tuple[str, str]],
+    match_threshold: float,
+) -> tuple[str, int, OcrLine] | None:
+    ranked_matches: list[tuple[int, float, float, str, OcrLine]] = []
+    for target_name, target_key in normalized_targets:
+        target_match = _find_best_target_match(lines, target_key, match_threshold)
+        if target_match is None:
+            continue
+        target_order_index, target_line = target_match
+        score = _target_match_score(target_key, _normalize_nav_text(target_line.text))
+        ranked_matches.append((target_order_index, -score, -target_line.confidence, target_name, target_line))
+
+    if not ranked_matches:
+        return None
+
+    ranked_matches.sort()
+    best_index, _best_score, _best_confidence, best_target_name, best_line = ranked_matches[0]
+    return best_target_name, best_index, best_line
 
 
 def _resolve_target_row_index(
@@ -1264,7 +1308,7 @@ def _target_match_score(target: str, candidate: str) -> float:
                 exact_code_matches += 1
             elif token not in {"ptn", "nac"}:
                 exact_core_matches += 1
-        elif token not in {"ptn", "nac"} and len(token) >= 4 and best_similarity >= 0.72:
+        elif token not in {"ptn", "nac"} and len(token) >= 4 and best_similarity >= 0.68:
             fuzzy_core_matches += 1
 
     token_score = weighted_matches / max(weighted_possible, 1.0)
@@ -1277,8 +1321,8 @@ def _target_match_score(target: str, candidate: str) -> float:
             (_nav_token_similarity(target_code, candidate_code) for target_code in target_code_tokens for candidate_code in candidate_code_tokens),
             default=0.0,
         )
-        if best_code_similarity < 0.85:
-            score *= 0.55
+        if best_code_similarity < 0.78:
+            score *= 0.72
 
     return score
 
@@ -1325,6 +1369,10 @@ def _nav_token_similarity(left: str, right: str) -> float:
         return 1.0
     if not left or not right:
         return 0.0
+    if _is_station_code_token(left) or _is_station_code_token(right):
+        normalized_left = _normalize_station_code_token(left)
+        normalized_right = _normalize_station_code_token(right)
+        return max(_levenshtein_ratio(left, right), _levenshtein_ratio(normalized_left, normalized_right))
     if len(left) == 3 and left.isalpha() and len(right) >= 5 and right.startswith(left):
         return 0.85
     if len(right) == 3 and right.isalpha() and len(left) >= 5 and left.startswith(right):
@@ -1342,6 +1390,28 @@ def _is_station_code_token(token: str) -> bool:
     letters = sum(character.isalpha() for character in token)
     digits = sum(character.isdigit() for character in token)
     return letters >= 2 and digits >= 1
+
+
+def _normalize_station_code_token(token: str) -> str:
+    normalized_chars: list[str] = []
+    for character in token.lower():
+        if character in {"0", "o", "q", "d"}:
+            normalized_chars.append("o")
+        elif character in {"1", "i", "l", "|", "!"}:
+            normalized_chars.append("i")
+        elif character in {"2", "z"}:
+            normalized_chars.append("z")
+        elif character in {"5", "s"}:
+            normalized_chars.append("s")
+        elif character in {"8", "b"}:
+            normalized_chars.append("b")
+        elif character in {"6", "g"}:
+            normalized_chars.append("g")
+        elif character in {"7", "t"}:
+            normalized_chars.append("t")
+        else:
+            normalized_chars.append(character)
+    return "".join(normalized_chars)
 
 
 def _levenshtein_ratio(left: str, right: str) -> float:

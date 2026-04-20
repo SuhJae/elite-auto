@@ -214,6 +214,38 @@ class TestNavigation(unittest.TestCase):
         self.assertEqual(kwargs["timings"], OcrNavTimings(move_interval_seconds=0.2))
         self.assertEqual(kwargs["config"], OcrNavConfig(save_debug_artifacts=False))
 
+    def test_lock_nav_destination_passes_target_names_when_provided(self) -> None:
+        ship_control = FakeShipControl()
+        input_adapter = FakeInputAdapter()
+        context = build_context(
+            [build_state(gui_focus=None), build_state(gui_focus=2), build_state(gui_focus=2)],
+            ship_control,
+            input_adapter,
+        )
+
+        ocr_action = MagicMock()
+        ocr_action.run.return_value = type("R", (), {"success": True, "debug": {"target_name": "HIP 17189"}})()
+
+        with patch("app.actions.navigation.MoveCursorToNavTarget", return_value=ocr_action) as action_cls:
+            result = LockNavDestination(
+                target_name="HIP 17189",
+                target_names=["HIP 17189", "HIP 20277"],
+                timings=NavigationTimings(
+                    panel_open_confirm_timeout_seconds=0.01,
+                    panel_open_retry_count=1,
+                    panel_open_poll_interval_seconds=0.0,
+                    tab_previous_interval_seconds=0.0,
+                    anchor_hold_seconds=0.0,
+                    anchor_settle_seconds=0.0,
+                    lock_select_interval_seconds=0.0,
+                    back_to_cockpit_wait_seconds=0.0,
+                ),
+            ).run(context)
+
+        self.assertTrue(result.success)
+        _, kwargs = action_cls.call_args
+        self.assertEqual(kwargs["target_names"], ["HIP 17189", "HIP 20277"])
+
 
 if __name__ == "__main__":
     unittest.main()

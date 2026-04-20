@@ -11,6 +11,7 @@ from app.actions.navigation_ocr import (
     _estimate_row_slot,
     _extract_fixed_row_lines,
     _find_best_target_match,
+    _find_best_target_match_for_any,
     _is_malformed_ocr_text,
     _locate_row_span_index,
     _ocr_row_with_fallbacks,
@@ -106,6 +107,39 @@ class TestNavigationOcrHelpers(unittest.TestCase):
         assert match is not None
         self.assertEqual(match[0], 1)
         self.assertEqual(match[1].text, "[BKRN] Event Horizon X5W-54J")
+
+    def test_find_best_target_match_accepts_ocr_confusable_carrier_code_characters(self) -> None:
+        lines = [
+            OcrLine(text="PTN RUNTIME TERROR B2K-37I", confidence=72.0, bbox=(0, 0, 10, 10)),
+            OcrLine(text="PTN PROTOCOL TERROR BFW-21W", confidence=88.0, bbox=(0, 15, 10, 10)),
+        ]
+
+        match = _find_best_target_match(lines, _normalize_nav_text("PTN RUNTIME TERROR BZK-37T"), 0.72)
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match[0], 0)
+        self.assertEqual(match[1].text, "PTN RUNTIME TERROR B2K-37I")
+
+    def test_find_best_target_match_for_any_prefers_topmost_visible_candidate(self) -> None:
+        lines = [
+            OcrLine(text="PTN LAKE KASANE BZZ-NTG", confidence=70.0, bbox=(0, 0, 10, 10)),
+            OcrLine(text="PTN RUNTIME TERROR BZK-37T", confidence=95.0, bbox=(0, 15, 10, 10)),
+        ]
+
+        match = _find_best_target_match_for_any(
+            lines,
+            [
+                ("PTN RUNTIME TERROR BZK-37T", _normalize_nav_text("PTN RUNTIME TERROR BZK-37T")),
+                ("PTN LAKE KASANE BZZ-NTG", _normalize_nav_text("PTN LAKE KASANE BZZ-NTG")),
+            ],
+            0.72,
+        )
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match[0], "PTN LAKE KASANE BZZ-NTG")
+        self.assertEqual(match[1], 0)
 
     def test_resolve_output_region_maps_absolute_window_to_monitor_relative_region(self) -> None:
         with patch(

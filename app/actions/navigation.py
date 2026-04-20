@@ -156,6 +156,7 @@ class LockNavDestination:
     """Open nav, OCR-select a destination, lock it, then return to cockpit."""
 
     target_name: str
+    target_names: list[str] | None = None
     timings: NavigationTimings = field(default_factory=NavigationTimings)
     ocr_config: OcrNavConfig = field(default_factory=OcrNavConfig)
 
@@ -176,6 +177,7 @@ class LockNavDestination:
 
         ocr_result = MoveCursorToNavTarget(
             target_name=self.target_name,
+            target_names=self.target_names,
             timings=OcrNavTimings(move_interval_seconds=0.2),
             config=self.ocr_config,
         ).run(context)
@@ -196,6 +198,7 @@ class LockNavDestination:
             "Navigation destination locked and cockpit restored.",
             debug={
                 "target_name": self.target_name,
+                "target_names": self.target_names,
                 "lock_select_interval_seconds": self.timings.lock_select_interval_seconds,
                 "back_to_cockpit_wait_seconds": self.timings.back_to_cockpit_wait_seconds,
                 "open_nav_panel": open_result.debug,

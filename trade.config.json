@@ -1,27 +1,87 @@
 {
-  "source": {
-    "station_name": "Khun Port",
-    "commodity_name": "Steel",
+  "sources": [
+    {
+      "id": "SITE-19",
+      "station_name": "SITE-19",
+      "commodity_name": "Agronomic Treatment",
+      "market_name": null,
+      "is_carrier": false,
+      "auto_launch_wait_seconds": 90.0,
+      "starting_units": 628912,
+      "remaining_units": 628912,
+      "done": false
+    }
+  ],
+  "destinations": [
+    {
+      "id": "BZK-37T",
+      "station_name": "PTN RUNTIME TERROR BZK-37T",
+      "commodity_name": "Agronomic Treatment",
+      "market_name": null,
+      "is_carrier": true,
+      "item_is_top": true,
+      "auto_launch_wait_seconds": 45.0,
+      "starting_units": 8462,
+      "remaining_units": 8462,
+      "done": false
+    },
+    {
+      "id": "BFW-21W",
+      "station_name": "PTN PROTOCOL TERROR BFW-21W",
+      "commodity_name": "Agronomic Treatment",
+      "market_name": null,
+      "is_carrier": true,
+      "item_is_top": true,
+      "auto_launch_wait_seconds": 45.0,
+      "starting_units": 10000,
+      "remaining_units": 7310,
+      "done": false
+    },
+    {
+      "id": "BLX-91W",
+      "station_name": "PTN LAKE YUKI BLX-91W",
+      "commodity_name": "Agronomic Treatment",
+      "market_name": null,
+      "is_carrier": true,
+      "item_is_top": true,
+      "auto_launch_wait_seconds": 45.0,
+      "starting_units": 10000,
+      "remaining_units": 10000,
+      "done": false
+    },
+    {
+      "id": "BZZ-NTG",
+      "station_name": "PTN LAKE KASANE BZZ-NTG",
+      "commodity_name": "Agronomic Treatment",
+      "market_name": null,
+      "is_carrier": true,
+      "item_is_top": true,
+      "auto_launch_wait_seconds": 45.0,
+      "starting_units": 10000,
+      "remaining_units": 10000,
+      "done": false
+    }
+  ],
+  "completion_station": {
+    "station_name": "SITE-19",
     "market_name": null,
-    "is_carrier": false,
-    "auto_launch_wait_seconds": 60.0
-  },
-  "destination": {
-    "station_name": "[BKRN] Event Horizon X5W-54J",
-    "market_name": null,
-    "is_carrier": true,
-    "item_is_top": true,
-    "auto_launch_wait_seconds": 45.0
+    "is_carrier": false
   },
   "safety": {
-    "source_max_buy_price": 7000,
-    "min_profit_per_unit": 5000,
-    "destination_min_demand": 1000
+    "source_max_buy_price": 8000,
+    "min_profit_per_unit": 5000
   },
   "runtime": {
+    "cargo_capacity_units": 1152,
     "start_delay_seconds": 3.0,
     "retry_attempts_per_state": 5,
     "retry_initial_wait_seconds": 10.0,
-    "retry_max_wait_seconds": 300.0
+    "retry_max_wait_seconds": 300.0,
+    "active_route": {
+      "source_id": "SITE-19",
+      "destination_id": "BFW-21W",
+      "commodity_name": "Agronomic Treatment"
+    },
+    "completion_requested": false
   }
 }
